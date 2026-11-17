@@ -1,0 +1,62 @@
+{
+  "tables": [
+    {
+      "name": "addresses",
+      "columns": [
+        {"name": "address_id", "type": "string", "nullable": false},
+        {"name": "region", "type": "string", "nullable": false}
+      ],
+      "primary_key": ["address_id"],
+      "foreign_keys": []
+    },
+    {
+      "name": "customers",
+      "columns": [
+        {"name": "customer_id", "type": "string", "nullable": false},
+        {"name": "name", "type": "string", "nullable": false},
+        {"name": "address_id", "type": "string", "nullable": true}
+      ],
+      "primary_key": ["customer_id"],
+      "foreign_keys": [
+        {"columns": ["address_id"], "ref_table": "addresses", "ref_columns": ["address_id"]}
+      ]
+    },
+    {
+      "name": "products",
+      "columns": [
+        {"name": "product_id", "type": "string", "nullable": false},
+        {"name": "name", "type": "string", "nullable": false},
+        {"name": "price", "type": "float", "nullable": false}
+      ],
+      "primary_key": ["product_id"],
+      "foreign_keys": []
+    },
+    {
+      "name": "orders",
+      "columns": [
+        {"name": "order_id", "type": "string", "nullable": false},
+        {"name": "customer_id", "type": "string", "nullable": false},
+        {"name": "channel", "type": "string", "nullable": false}
+      ],
+      "primary_key": ["order_id"],
+      "foreign_keys": [
+        {"columns": ["customer_id"], "ref_table": "customers", "ref_columns": ["customer_id"]}
+      ]
+    },
+    {
+      "name": "order_lines",
+      "columns": [
+        {"name": "line_id", "type": "string", "nullable": false},
+        {"name": "order_id", "type": "string", "nullable": false},
+        {"name": "product_id", "type": "string", "nullable": false},
+        {"name": "quantity", "type": "int", "nullable": false}
+      ],
+      "primary_key": ["line_id"],
+      "unique_keys": [["order_id", "line_id"]],
+      "foreign_keys": [
+        {"columns": ["order_id"], "ref_table": "orders", "ref_columns": ["order_id"]},
+        {"columns": ["product_id"], "ref_table": "products", "ref_columns": ["product_id"]}
+      ]
+    }
+  ]
+}

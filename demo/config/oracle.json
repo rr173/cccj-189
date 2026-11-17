@@ -1,0 +1,13 @@
+{
+  "command": [
+    "python3",
+    "-I",
+    "demo/transform/etl_quality_gate.py",
+    "{candidate_dir}",
+    "{report_file}"
+  ],
+  "timeout_seconds": 20.0,
+  "retest_runs": 1,
+  "confirm_runs": 2,
+  "max_calls": 100
+}

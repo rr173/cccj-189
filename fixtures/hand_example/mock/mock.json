@@ -1,0 +1,5 @@
+{
+  "schema_path": "fixtures/hand_example/schema.json",
+  "fail_rows": ["C/b"],
+  "fail_signature": "SIG-BAD-ROW"
+}

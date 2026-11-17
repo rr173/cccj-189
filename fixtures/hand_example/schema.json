@@ -1,0 +1,24 @@
+{
+  "tables": [
+    {
+      "name": "P",
+      "columns": [
+        {"name": "id", "type": "string", "nullable": false},
+        {"name": "label", "type": "string", "nullable": true}
+      ],
+      "primary_key": ["id"]
+    },
+    {
+      "name": "C",
+      "columns": [
+        {"name": "id", "type": "string", "nullable": false},
+        {"name": "p_id", "type": "string", "nullable": false},
+        {"name": "kind", "type": "string", "nullable": true}
+      ],
+      "primary_key": ["id"],
+      "foreign_keys": [
+        {"columns": ["p_id"], "ref_table": "P", "ref_columns": ["id"]}
+      ]
+    }
+  ]
+}

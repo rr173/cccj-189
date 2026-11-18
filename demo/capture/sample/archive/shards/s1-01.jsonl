@@ -1,0 +1,3 @@
+{"after": {"amount": 20}, "before": {"amount": 10}, "key": {"key": "k"}, "kind": "change", "offset": 0, "op": "update", "source_id": "src-hand-1", "stream": "s1", "table": "accounts", "tx_id": "A", "tx_order": 1}
+{"after": {"note": null}, "before": {"note": "old"}, "key": {"key": "k"}, "kind": "change", "offset": 1, "op": "update", "source_id": "src-hand-1", "stream": "s1", "table": "accounts", "tx_id": "A", "tx_order": 2}
+{"event_count": 1, "kind": "abort", "offset": 6, "source_id": "src-hand-1", "stream": "s1", "table_counts": {"accounts": 1}, "tx_id": "C"}

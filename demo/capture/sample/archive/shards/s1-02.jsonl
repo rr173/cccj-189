@@ -1,0 +1,3 @@
+{"kind": "heartbeat", "offset": 7, "source_id": "src-hand-1", "stream": "s1"}
+{"after": {}, "before": {}, "key": {"key": "k"}, "kind": "change", "new_key": {"key": "z"}, "offset": 3, "op": "update", "source_id": "src-hand-1", "stream": "s1", "table": "accounts", "tx_id": "B", "tx_order": 1}
+{"after": {"amount": 999}, "before": {"amount": 20}, "key": {"key": "k"}, "kind": "change", "offset": 5, "op": "update", "source_id": "src-hand-1", "stream": "s1", "table": "accounts", "tx_id": "C", "tx_order": 1}

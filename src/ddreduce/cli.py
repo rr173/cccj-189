@@ -1,10 +1,13 @@
-"""Command line interface: reduce, resume, verify, log-replay, log-reduce, log-verify.
+"""Command line interface: reduce, resume, verify, log-replay, log-reduce,
+log-verify, capture-import, capture-verify.
 
 Exit codes:
   0  CERTIFIED (reduce/resume/log-reduce) or VERIFIED_MINIMAL (verify/log-verify);
-     log-replay: the log is valid and the replay report was produced
+     log-replay: the log is valid and the replay report was produced;
+     capture-import: the package was built; capture-verify: package matched
   2  baseline rejected / certificate REJECTED / non-minimal or unknown neighbor /
-     invalid change log
+     invalid change log / invalid or conflicting capture archive / restore
+     failure / capture package mismatch
   3  call budget exhausted
   4  interrupted
   1  any other tool error (bad arguments, invalid schema/data, ...)
@@ -30,6 +33,17 @@ from .schema import Schema, load_schema
 from .state import SearchState
 from .values import DataError, SchemaError
 from .verify import Verifier, write_report
+from .capture import (
+    CaptureError,
+    run_import,
+    run_verify,
+)
+from .capture.verifier import (
+    VERDICT_ARCHIVE,
+    VERDICT_MATCH,
+    VERDICT_PACKAGE,
+    VERDICT_RESTORE,
+)
 
 
 def _load_pieces(args: argparse.Namespace) -> tuple[Schema, Database, OracleConfig]:
@@ -398,6 +412,71 @@ def cmd_log_verify(args: argparse.Namespace) -> int:
     return 2
 
 
+# ============================================================== capture mode
+def cmd_capture_import(args: argparse.Namespace) -> int:
+    """Restore a capture-v1 archive into a full-image log package (no oracle)."""
+    try:
+        result = run_import(
+            archive=args.archive,
+            snapshot_dir=args.snapshot,
+            schema_path=args.schema,
+            output_dir=args.out,
+            through=args.through,
+            tmp_root=args.tmpdir,
+        )
+    except CaptureError as exc:
+        print(f"CAPTURE IMPORT FAILED: {exc}", file=sys.stderr)
+        return 2
+    counts = result.report["counts"]
+    print(f"CAPTURE PACKAGE: {result.output_dir}")
+    print(
+        "physical messages: {physical_messages_read} "
+        "(duplicates {physical_duplicates}); heartbeats: {heartbeats}; "
+        "transactions: {transactions_total} (committed {committed_total}, "
+        "aborted {aborted_total}); exported tx: {exported_transactions}, "
+        "exported events: {exported_events}; peak spill bytes: "
+        "{peak}".format(
+            peak=result.peak_spill_bytes, **counts,
+        )
+    )
+    if args.report:
+        Path(args.report).write_text(
+            json.dumps(result.report, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"report: {args.report}")
+    return 0
+
+
+def cmd_capture_verify(args: argparse.Namespace) -> int:
+    """Independently re-restore an archive and compare a package (no oracle)."""
+    try:
+        result = run_verify(
+            archive=args.archive,
+            snapshot_dir=args.snapshot,
+            schema_path=args.schema,
+            through=args.through,
+            package_dir=args.package,
+            tmp_root=args.tmpdir,
+        )
+    except CaptureError as exc:
+        print(f"CAPTURE VERIFY FAILED: {exc}", file=sys.stderr)
+        return 2
+    text = json.dumps(result.report, ensure_ascii=False, sort_keys=True, indent=2)
+    if args.report:
+        Path(args.report).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    if result.verdict == VERDICT_MATCH:
+        print(f"{VERDICT_MATCH}: {args.package}", file=sys.stderr)
+        return 0
+    print(
+        f"{result.verdict}: {len(result.failures)} discrepancy(ies); details above",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ddreduce",
@@ -474,6 +553,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_log_verify.add_argument("--max-calls", type=int, default=None)
     p_log_verify.add_argument("--no-cache", action="store_true")
     p_log_verify.set_defaults(func=cmd_log_verify)
+
+    # ------------------------------------------------------------- capture v1
+    capture_common = argparse.ArgumentParser(add_help=False)
+    capture_common.add_argument(
+        "--archive", required=True, help="capture-v1 archive directory (with capture.json)"
+    )
+    capture_common.add_argument(
+        "--snapshot", required=True, help="starting snapshot directory of JSONL tables"
+    )
+    capture_common.add_argument("--schema", required=True, help="target schema JSON file")
+    capture_common.add_argument(
+        "--through", required=True, type=int,
+        help="export commits with snapshot_commit_seq < commit_seq <= THROUGH",
+    )
+    capture_common.add_argument(
+        "--tmpdir", default=None,
+        help="directory for spill working files (defaults to the system temp dir)",
+    )
+
+    p_capture_import = sub.add_parser(
+        "capture-import",
+        parents=[capture_common],
+        help="restore a capture-v1 archive into a full-image changes package",
+    )
+    p_capture_import.add_argument(
+        "--out", required=True,
+        help="new output directory (must not exist; never overwritten)",
+    )
+    p_capture_import.add_argument(
+        "--report", default=None, help="also copy the capture report JSON here"
+    )
+    p_capture_import.set_defaults(func=cmd_capture_import)
+
+    p_capture_verify = sub.add_parser(
+        "capture-verify",
+        parents=[capture_common],
+        help="independently re-restore an archive and verify a captured package",
+    )
+    p_capture_verify.add_argument(
+        "--package", required=True, help="package directory produced by capture-import"
+    )
+    p_capture_verify.add_argument(
+        "--report", default=None, help="write the verification report JSON here"
+    )
+    p_capture_verify.set_defaults(func=cmd_capture_verify)
     return parser
 
 

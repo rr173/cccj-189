@@ -1,0 +1,3 @@
+{"commit_seq": 13, "event_count": 2, "kind": "commit", "offset": 2, "source_id": "src-hand-1", "stream": "s1", "table_counts": {"accounts": 2}, "tx_id": "A"}
+{"after": {"amount": 20}, "before": {"amount": 10}, "key": {"key": "k"}, "kind": "change", "offset": 0, "op": "update", "source_id": "src-hand-1", "stream": "s1", "table": "accounts", "tx_id": "A", "tx_order": 1}
+{"commit_seq": 14, "event_count": 1, "kind": "commit", "offset": 4, "source_id": "src-hand-1", "stream": "s1", "table_counts": {"accounts": 1}, "tx_id": "B"}

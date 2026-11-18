@@ -1,0 +1,38 @@
+{
+  "bindings": {
+    "tables": {
+      "accounts": {
+        "columns": {
+          "amount": "amount",
+          "key": "key",
+          "note": "note"
+        },
+        "target": "accounts"
+      }
+    }
+  },
+  "files": [
+    "shards/s1-00.jsonl",
+    "shards/s1-01.jsonl",
+    "shards/s1-02.jsonl",
+    "shards/s2-00.jsonl",
+    "shards/s2-01.jsonl",
+    "shards/s2-02.jsonl"
+  ],
+  "sealed_commit_seq": 14,
+  "snapshot_commit_seq": 12,
+  "source_id": "src-hand-1",
+  "streams": [
+    {
+      "first_offset": 0,
+      "last_offset": 7,
+      "name": "s1"
+    },
+    {
+      "first_offset": 0,
+      "last_offset": 2,
+      "name": "s2"
+    }
+  ],
+  "version": 1
+}

@@ -382,7 +382,231 @@ runtime artifact and is not committed.
 
 ---
 
-## 6. Test suite
+## 6. Offline capture-v1 ingestion (`capture-import` / `capture-verify`)
+
+Operations sometimes receives a **partitioned capture archive** rather than a
+ready-made full-image log: one transaction's row changes are scattered across
+several JSONL shards, retransmitted records appear more than once, and update
+messages usually name only the columns that changed.  Hand-assembling the
+`changes.jsonl` the log tools consume is exactly how fault history gets
+silently rewritten.
+
+The two offline commands below restore such an archive into the existing
+full-image input package without adding any reduction strategy and without
+touching the existing searchers. **Neither command ever runs an oracle**; the
+result is handed to the normal `log-replay` / `log-reduce` afterwards.
+
+### The capture-v1 format
+
+An archive is a plain directory holding one `capture.json` manifest and the
+regular JSONL shard files it declares (no symlinks, no escaping paths, no
+undeclared files):
+
+```json
+{
+  "version": 1,
+  "source_id": "src-hand-1",
+  "snapshot_commit_seq": 12,
+  "sealed_commit_seq": 14,
+  "streams": [{"name": "s1", "first_offset": 0, "last_offset": 11}],
+  "files": ["shards/s1-00.jsonl", "shards/s1-01.jsonl"],
+  "bindings": {
+    "tables": {
+      "accounts": {
+        "target": "accounts",
+        "columns": {"key": "key", "amount": "amount", "note": "note"}
+      }
+    }
+  }
+}
+```
+
+* `version` must be `1`; any other value is refused.
+* `snapshot_commit_seq` is the last commit point already contained in the
+  starting snapshot; `sealed_commit_seq` is the high-water mark the archive
+  promises to have sealed.  Gaps between commit sequence numbers are allowed.
+* Every `streams` entry names a closed integer interval
+  `[first_offset, last_offset]`; **every** integer position in it must contain
+  exactly one unique physical message, or the archive is rejected.
+* `bindings` maps source table/column names onto the target schema.  Tables
+  and columns are one-to-one and must cover **every** target table and
+  column - no filtering, no implicit column drops.  Source names may differ
+  completely from target names.
+
+Every shard line is one message with the shared envelope
+`source_id`, `stream`, `offset`, `kind`.  `source_id` must equal the
+manifest; `offset` is a non-negative integer (booleans are never accepted as
+numbers); `kind` is one of `change`, `commit`, `abort`, `heartbeat`.
+
+| kind | extra fields |
+| --- | --- |
+| `change` | non-empty string `tx_id`, integer `tx_order` ≥ 1, source `table`, `op` (insert/update/delete), full primary-key `key`, and the op-specific `before`/`after`; updates may additionally carry a full `new_key` |
+| `commit` | `tx_id`, non-negative `commit_seq`, non-negative `event_count`, `table_counts` |
+| `abort` | `tx_id`, `event_count`, `table_counts` (no `commit_seq`) |
+| `heartbeat` | envelope only; never part of a transaction |
+
+`table_counts` maps source table to a positive logical row-change count; the
+sum of its positive entries equals `event_count`, and a zero-event
+transaction uses an empty object `{}`.  Missing fields, unknown fields and
+booleans impersonating integers are all rejected.
+
+Image rules on `change` messages:
+
+* `insert` carries a **complete** `after` (every source column present,
+  explicit null allowed) and no `before`; the key must currently be absent.
+* `delete` carries a partial `before` (the empty object is allowed); the
+  importer completes the output before-image from the current full row.
+* `update` carries partial `before` and partial `after`.  A column named in
+  `before` is asserted against the current row; columns named in `after`
+  overwrite it.  A **missing column means preserve**; an explicit JSON
+  `null` means *write null* - the two are never confused.  An empty `after`
+  is still an update and is never dropped.
+* An update normally keeps its primary key.  An update may instead carry a
+  complete `new_key`; when the key actually changes the importer expands the
+  event, at its original position, into an adjacent `delete` of the old row
+  and `insert` of the new row, keeping both full images.  A new key that
+  already exists is refused (no overwrite); `new_key` on any other op is
+  refused.
+
+### De-duplication and closure semantics
+
+File order and in-file message order are transport order with no business
+meaning.
+
+* The same `(stream, offset)` repeated with identical canonical content
+  (formatting/key-order differences ignored) merges as a physical
+  retransmission; different content at one coordinate is a hard conflict.
+* The same `(tx_id, tx_order)` may be delivered at several coordinates: it is
+  one logical change when the business content (coordinates stripped) is
+  identical, and **all** coordinates are retained for provenance; different
+  content is a conflict - one variant is never picked arbitrarily.
+* Transaction end decisions follow the same rule; a commit and an abort for
+  the same transaction, or a retransmitted commit whose content changed, are
+  conflicts.
+* The archive is closed: every transaction with changes has exactly one
+  consistent end decision, `tx_order` runs exactly `1..event_count`, and
+  `table_counts` match the logical events.  Commit sequence numbers are
+  unique across committed transactions (gaps allowed).  Aborted events pass
+  all structural, completeness and de-duplication checks but are never
+  applied to row state.
+* Coordinate conflicts and coverage gaps are rejected even when the affected
+  messages fall outside the requested export window.
+
+### Restoration window and output
+
+`capture-import --through C` exports only committed transactions with
+`snapshot_commit_seq < commit_seq <= C`, where
+`snapshot_commit_seq <= C <= sealed_commit_seq`.  Earlier and later
+transactions still participate in every archive integrity check, but their
+row images never touch the restored state of the export window.  Transactions
+are ordered by `commit_seq` - never by offset, file name or `tx_id`.  A
+non-empty transaction, even when its events span partitions, produces exactly
+one `changes.jsonl` line.  Zero-event commits are checked and counted, keep
+their end message and coordinates in the map, but produce no empty events log
+line (the old log format rejects those).
+
+Cross-row unique and foreign-key constraints may temporarily fail between a
+transaction's own events; they are judged only at commit, reusing the
+existing schema semantics (so an in-transaction unique-value swap or
+child-before-parent insert is legal).  Any event or commit error fails the
+whole import - bad transactions are never skipped to produce a
+seemingly-complete package.
+
+The output directory is brand new (an existing path is never overwritten) and
+is assembled in a hidden staging directory that is renamed into place only on
+success; failures and interruptions remove all staging and spill state.  The
+package contains exactly:
+
+```
+<out>/snapshot/<table>.jsonl   verbatim starting snapshot
+<out>/schema.json              the target schema
+<out>/changes.jsonl            full-image committed transactions (old log format)
+<out>/capture-map.jsonl        every output tx/event -> source logical event
+                               and ALL transport coordinates
+<out>/capture-report.json      counts, bindings, input/window and hashes
+```
+
+The map traces each output event (including both halves of a key-move
+expansion) back to its source `(tx_id, tx_order)` and every coordinate it was
+seen at.  `tx_id` values are preserved verbatim.
+
+### Independent verification
+
+`capture-verify` takes the original archive, snapshot, schema, window and a
+package, and re-runs the whole scan, de-duplication, assembly and restoration
+itself.  It then compares the complete transaction images, window boundary,
+provenance map and report bindings/counts against the package.  It never
+reads an "import succeeded" flag and never compares only final table state -
+so a dropped-but-overwritten update, a folded delete/rebuild, rewritten
+transport coordinates or doctored counts are all caught.  Verdicts are
+deliberately not oracle-style PASS/FAIL:
+
+* `CAPTURE_PACKAGE_MATCH` - the independent restoration equals the package;
+* `ARCHIVE_INVALID` - the source archive itself is incomplete or conflicting;
+* `RESTORE_FAILED` - a valid archive cannot be restored against the given
+  snapshot/schema (stale before-image, key collision, commit constraint, ...);
+* `PACKAGE_MISMATCH` - restoration succeeds but the package differs.
+
+Failures name the source stream/offset, transaction and logical order.
+
+### Commands
+
+```bash
+# Restore an archive into a full-image package (no oracle is started).
+PYTHONPATH=src python3 -P -m ddreduce.cli capture-import \
+  --archive demo/capture/sample/archive \
+  --snapshot demo/capture/sample/snapshot \
+  --schema demo/capture/sample/schema.json \
+  --through 14 --out /tmp/capture-package
+
+# Independently re-restore and compare the package.
+PYTHONPATH=src python3 -P -m ddreduce.cli capture-verify \
+  --archive demo/capture/sample/archive \
+  --snapshot demo/capture/sample/snapshot \
+  --schema demo/capture/sample/schema.json \
+  --through 14 --package /tmp/capture-package
+
+# The result then feeds the unchanged existing tools.
+PYTHONPATH=src python3 -P -m ddreduce.cli log-replay \
+  --snapshot /tmp/capture-package/snapshot \
+  --schema /tmp/capture-package/schema.json \
+  --changes /tmp/capture-package/changes.jsonl
+```
+
+`capture-import`/`capture-verify` exit `0` on match/success and `2` on any
+archive, restore or package failure.
+
+### Bounded sample and reproducible generator
+
+`demo/capture/sample/` is a small, committed cross-partition archive built by
+`demo/capture/gen_capture.py`.  Its hand-computed scenario: snapshot key `k`
+has `amount=10, note="old"`; transaction A (commit point 13) first sets
+`amount=20` then explicitly sets `note` to null; transaction B (commit point
+14) moves key `k` to `z`; an aborted transaction that would set
+`amount=999` is present but never applied.  A's messages are retransmitted
+(physically and logically), the shards are shuffled and B's commit arrives
+before B's change.  The correct restoration is one line for A with two
+full-image updates and one line for B as adjacent delete/insert, with B's
+complete before image equal to `amount=20, note=null`.
+
+```bash
+# Bounded hand sample (also emits --flavor direct|overwrite, two archives
+# with the same final row but different histories).
+python3 -I demo/capture/gen_capture.py --out /tmp/sample --flavor hand --seed 7 --shards 3
+# Larger archives are generated at runtime for the resource tests only.
+python3 -I demo/capture/gen_capture.py --out /tmp/big --flavor large --tx 2000 --keys 200
+```
+
+The scan/de-duplication/assembly stage spills to a temporary SQLite database
+(messages, transaction grouping and per-event provenance are never held in
+memory as the archive grows); only the snapshot and current row state stay in
+memory, and output provenance is streamed one record at a time.  Spill files
+are removed on both success and failure; the large-scale test measures peak
+heap and spill bytes against archive growth and checks the cleanup.
+
+---
+
+## 7. Test suite
 
 The suite uses an external, deliberately configurable mock oracle
 (`tests/mock_oracle.py`) plus the real demo ETL and the real incremental
@@ -417,7 +641,38 @@ aggregation command. It covers:
   selection, per-commit state, and certificate neighbors on small logs;
 - log-mode budget exhaustion, SIGTERM + resume, input/schema/oracle-behavior
   change refusal, unknown neighbors, and `log-replay` reporting;
-- a generated 160-transaction log checking bounded staging/cache disk usage.
+- a generated 160-transaction log checking bounded staging/cache disk usage;
+- **capture-v1 ingestion**: manifest/message field tables and rejection rules
+  (unsupported version, escaping/duplicate/symlink paths, undeclared streams,
+  out-of-range offsets, booleans impersonating integers, binding bijection and
+  full-coverage rules);
+- capture stream coverage gaps (with first missing offset), physical
+  same-coordinate conflicts, logical `(tx_id, tx_order)` conflicts,
+  commit/abort and changed-commit conflicts, end count/table-count mismatch,
+  missing end decisions, duplicate `commit_seq`, and conflicts hidden inside
+  out-of-window transactions;
+- partial-image restoration (preserve vs explicit null, empty-after updates,
+  stale before-images, aborted events never applied), key-move expansion into
+  delete/insert with full provenance, key-move target collision, in-transaction
+  unique-value swaps and child-before-parent commits;
+- the exact hand-computed cross-partition sample, window truncation,
+  zero-event commit bookkeeping, deterministic regeneration and full
+  provenance retention under reordering/retransmission;
+- randomized multi-transaction archives (shard reordering, physical and
+  logical retransmissions, aborts, heartbeats, window cuts) cross-checked
+  against an independent naive reference replayer that shares no product
+  imaging/merge code, plus "same final row, different history" archives that
+  must never compare equal;
+- end-to-end re-encoding of the incremental demo's full-image log into a
+  partial-image capture archive, restoring it and reproducing the same
+  aggregation divergence through the real demo command, with the package also
+  accepted by the existing `log-replay`;
+- independent `capture-verify` tamper detection: dropped overwritten updates,
+  folded delete/rebuilds, rewritten transport provenance, doctored counts and
+  extra package files, with the three failure classes kept distinct;
+- source-to-target table/column renaming bindings and post-rename type rules;
+- a runtime-generated large archive checking bounded heap growth, linear spill
+  growth and spill/staging cleanup on both success and failure.
 
 Run the suite:
 
@@ -445,10 +700,19 @@ src/ddreduce/
   replay.py    version/absence witnesses, normalized replay, log candidates
   logengine.py batch ddmin over transaction deletions + per-transaction pass
   logverify.py independent CDC certificate verification
+  capture/     offline capture-v1 archive ingestion (no oracle, no new reducer)
+    manifest.py   capture.json parsing, path safety, binding bijections
+    messages.py   envelope/kind field tables and structural message validation
+    store.py      streaming SQLite-backed scan, de-duplication and assembly
+    restore.py    partial-image row restoration, key moves, commit constraints
+    importer.py   capture-import: windowed restore into a full-image package
+    verifier.py   capture-verify: independent re-restore and package comparison
   cli.py       reduce / resume / verify / log-replay / log-reduce / log-verify
+               / capture-import / capture-verify
 demo/
   transform/   real multi-table ETL command, schema, data, oracle config
   incremental/ real CDC incremental aggregation command, data, log generator
+  capture/     capture-v1 hand sample plus the reproducible archive generator
 fixtures/      small committed hand-computed fixture
-tests/         mock oracle, naive replayer, and the full scenario suite
+tests/         mock oracle, naive replayers, and the full scenario suite
 ```

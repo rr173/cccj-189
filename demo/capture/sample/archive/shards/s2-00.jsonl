@@ -1,0 +1,1 @@
+{"after": {"note": null}, "before": {"note": "old"}, "key": {"key": "k"}, "kind": "change", "offset": 0, "op": "update", "source_id": "src-hand-1", "stream": "s2", "table": "accounts", "tx_id": "A", "tx_order": 2}

@@ -49,6 +49,25 @@ def make_cache_key(
     return CacheKey(digest)
 
 
+def make_log_cache_key(candidate, schema: Schema, config: OracleConfig) -> CacheKey:
+    """Cache key for CDC candidates.
+
+    The candidate hash covers the fixed snapshot *and* the ordered candidate
+    log including transaction boundaries, so two histories that produce the
+    same final table never share an entry.  Schema and the oracle behavior
+    configuration are bound exactly as in tables mode.
+    """
+    payload = {
+        "version": CACHE_VERSION,
+        "mode": "log",
+        "candidate_hash": candidate.content_hash(),
+        "schema": schema.canonical(),
+        "oracle": config.canonical(),
+    }
+    digest = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    return CacheKey(digest)
+
+
 class OracleCache:
     def __init__(self, work_dir: Path):
         self.root = Path(work_dir) / "cache"

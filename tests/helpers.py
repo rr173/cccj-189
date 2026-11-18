@@ -111,3 +111,54 @@ class TempDir:
 
     def cleanup(self):
         shutil.rmtree(self.path, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ CDC logs
+def tx(tx_id, *events) -> dict:
+    return {"tx_id": tx_id, "events": list(events)}
+
+
+def ins(table, key, after) -> dict:
+    return {"op": "insert", "table": table, "key": key, "after": after}
+
+
+def upd(table, key, before, after) -> dict:
+    return {"op": "update", "table": table, "key": key, "before": before, "after": after}
+
+
+def dele(table, key, before) -> dict:
+    return {"op": "delete", "table": table, "key": key, "before": before}
+
+
+def make_log_fixture(
+    base: Path,
+    schema: dict,
+    snapshot_tables: dict[str, list[dict]],
+    changes: list[dict],
+    mock: dict | None = None,
+    *,
+    timeout: float = 10.0,
+    retest_runs: int = 1,
+    confirm_runs: int = 2,
+    max_calls: int = 200,
+):
+    """Create schema/snapshot/changes (+ optional mock oracle) under ``base``."""
+    schema_path = write_json(base / "schema.json", schema)
+    snapshot_dir = base / "snapshot"
+    for name, rows in snapshot_tables.items():
+        write_jsonl(snapshot_dir / f"{name}.jsonl", rows)
+    changes_path = write_jsonl(base / "changes.jsonl", changes)
+    oracle_path = None
+    if mock is not None:
+        mock = dict(mock)
+        mock["schema_path"] = str(schema_path)
+        mock_path = write_json(base / "mock" / "mock.json", mock)
+        oracle_path = make_oracle_config(
+            base / "oracle.json",
+            mock_path,
+            timeout=timeout,
+            retest_runs=retest_runs,
+            confirm_runs=confirm_runs,
+            max_calls=max_calls,
+        )
+    return schema_path, snapshot_dir, changes_path, oracle_path

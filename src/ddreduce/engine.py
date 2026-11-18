@@ -27,7 +27,21 @@ from .state import SearchState, StateStore
 from .values import canonical_json
 
 TOOL_NAME = "ddreduce"
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
+
+# Behavior-relevant oracle settings bound into state, cache and certificates.
+# (max_calls is a budget, not behavior, and may grow on resume.)
+ORACLE_BEHAVIOR_KEYS = (
+    "command",
+    "timeout_seconds",
+    "retest_runs",
+    "confirm_runs",
+    "report_file",
+)
+
+
+def oracle_behavior(config: OracleConfig) -> dict:
+    return {k: getattr(config, k) for k in ORACLE_BEHAVIOR_KEYS}
 
 
 class BudgetExhausted(RuntimeError):
@@ -85,6 +99,7 @@ class Reducer:
                 input_hash=self.original.content_hash(),
                 target_signature=None,
                 max_calls=self.config.max_calls,
+                oracle_behavior=oracle_behavior(self.config),
             )
             self.store.save(state)
 
@@ -110,18 +125,22 @@ class Reducer:
         return state
 
     def _resume_checks(self, state: SearchState) -> None:
+        if state.mode != "tables":
+            raise BaselineRejected(
+                "workdir belongs to a log-mode search; use 'log-reduce' or "
+                "'resume' (which auto-detects the mode) instead"
+            )
         if state.input_hash != self.original.content_hash():
             raise BaselineRejected(
                 "input content changed since the search was started; refusing resume"
             )
-        disk_config = OracleConfig.load(state.oracle_config_path)
-        # max_calls is a search budget, not oracle behavior: it may grow on
-        # resume. Everything else must match bit-for-bit.
-        behavior_keys = ("command", "timeout_seconds", "retest_runs",
-                         "confirm_runs", "report_file")
-        current = {k: getattr(self.config, k) for k in behavior_keys}
-        on_disk = {k: getattr(disk_config, k) for k in behavior_keys}
-        if canonical_json(current) != canonical_json(on_disk):
+        # The behavior configuration recorded when the search began is
+        # authoritative: a changed command/timeout/count refuses the resume
+        # instead of silently reusing old conclusions.  (State files from
+        # before this field existed carry no record and are tolerated.)
+        if state.oracle_behavior and canonical_json(
+            state.oracle_behavior
+        ) != canonical_json(oracle_behavior(self.config)):
             raise BaselineRejected(
                 "oracle configuration changed since the search was started"
             )
@@ -339,6 +358,7 @@ class Reducer:
         certificate = {
             "tool": TOOL_NAME,
             "version": TOOL_VERSION,
+            "mode": "tables",
             "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "input": {
                 "directory": self.input_dir,

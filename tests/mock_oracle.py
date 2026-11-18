@@ -85,6 +85,60 @@ def _read_tables(
     return rows
 
 
+def _pk_key(key_obj: dict, pk: list[str]) -> str:
+    return json.dumps([key_obj[c] for c in pk], sort_keys=True)
+
+
+def _read_package(
+    candidate_dir: Path, pk_map: dict[str, list[str]]
+) -> tuple[list[tuple[str, dict, list[str]]], list]:
+    """Read a candidate: static tables, or a CDC package (snapshot/ + log).
+
+    Returns (rows, tx_ids); tx_ids is empty for static table packages.
+    """
+    changes = candidate_dir / "changes.jsonl"
+    snapshot = candidate_dir / "snapshot"
+    if not (changes.exists() and snapshot.is_dir()):
+        return _read_tables(candidate_dir, pk_map), []
+
+    # CDC package: apply the candidate log to the snapshot tables.
+    state: dict[str, dict[str, dict]] = {}
+    pks: dict[str, list[str]] = {}
+    for path in sorted(snapshot.glob("*.jsonl")):
+        table = path.stem
+        pk = pk_map.get(table, [])
+        pks[table] = pk
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                state.setdefault(table, {})[_pk_key(row, pk)] = row
+    tx_ids: list = []
+    with open(changes, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            tx = json.loads(line)
+            tx_ids.append(tx["tx_id"])
+            for ev in tx["events"]:
+                table = ev["table"]
+                pk = pks.get(table) or pk_map.get(table, [])
+                key = _pk_key(ev["key"], pk)
+                if ev["op"] == "delete":
+                    state.get(table, {}).pop(key, None)
+                else:
+                    state.setdefault(table, {})[key] = ev["after"]
+    rows = [
+        (table, row, pks.get(table, []))
+        for table, by_key in sorted(state.items())
+        for row in by_key.values()
+    ]
+    return rows, tx_ids
+
+
 def _spawn_sleepers(n: int) -> None:
     """Spawn long-lived children to verify whole-group kill on timeout.
 
@@ -123,7 +177,7 @@ def main(argv: list[str]) -> int:
             schema_json = json.load(fh)
         for table_def in schema_json["tables"]:
             pk_map[table_def["name"]] = list(table_def["primary_key"])
-    rows_raw = _read_tables(candidate_dir, pk_map)
+    rows_raw, tx_ids = _read_package(candidate_dir, pk_map)
     rows = [(t, r) for t, r, _pk in rows_raw]
     present = {_row_id(t, r, pk) for t, r, pk in rows_raw}
 
@@ -150,10 +204,14 @@ def main(argv: list[str]) -> int:
     #   timeout_requires_absent: hang only once every listed sentinel is gone;
     #   timeout_when_rows_below:  hang only once the package is this small
     # (so the full input confirms cleanly while a small neighbor goes unknown).
+    # For CDC packages, timeout_when_tx_below does the same on transaction count.
     guard = cfg.get("timeout_requires_absent", [])
     sentinel_still_present = any(g in present for g in guard)
     below = cfg.get("timeout_when_rows_below")
     shape_allows = (below is None) or (len(rows) < int(below))
+    tx_below = cfg.get("timeout_when_tx_below")
+    if tx_below is not None:
+        shape_allows = shape_allows and (len(tx_ids) < int(tx_below))
     timeout_trigger = (
         bool(present.intersection(cfg.get("timeout_rows", [])))
         or bool(pred_timeout)
@@ -207,6 +265,12 @@ def main(argv: list[str]) -> int:
         hit = sorted(set(hit) | set(pred_fail))
     if cfg.get("fail_always"):
         hit = sorted(set(hit) | {"__always__"})
+    # CDC transaction-set triggers: fail when every tx_id of a set is present.
+    tx_present = set(tx_ids)
+    for tx_set in cfg.get("fail_tx_sets", []):
+        if tx_set and all(t in tx_present for t in tx_set):
+            hit = sorted(set(hit) | {f"tx:{t}" for t in tx_set})
+            break
     if hit and not any(flaky_pass(r) for r in hit):
         # Extra per-row signature overrides (for "same target, other signature"
         # and "two alternative fault groups" scenarios).

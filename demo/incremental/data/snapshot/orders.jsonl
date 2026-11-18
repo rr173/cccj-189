@@ -1,0 +1,5 @@
+{"order_id": "O1", "status": "open", "amount": 100.0}
+{"order_id": "O2", "status": "paid", "amount": 200.0}
+{"order_id": "O3", "status": "shipped", "amount": 50.0}
+{"order_id": "O4", "status": "open", "amount": 75.0}
+{"order_id": "O5", "status": "paid", "amount": 25.0}

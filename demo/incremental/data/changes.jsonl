@@ -1,0 +1,6 @@
+{"tx_id": "t1", "events": [{"op": "update", "table": "orders", "key": {"order_id": "O2"}, "before": {"order_id": "O2", "status": "paid", "amount": 200.0}, "after": {"order_id": "O2", "status": "paid", "amount": 260.0}}]}
+{"tx_id": "t2", "events": [{"op": "update", "table": "orders", "key": {"order_id": "O1"}, "before": {"order_id": "O1", "status": "open", "amount": 100.0}, "after": {"order_id": "O1", "status": "paid", "amount": 100.0}}]}
+{"tx_id": "t3", "events": [{"op": "delete", "table": "orders", "key": {"order_id": "O4"}, "before": {"order_id": "O4", "status": "open", "amount": 75.0}}]}
+{"tx_id": "t4", "events": [{"op": "insert", "table": "orders", "key": {"order_id": "O4"}, "after": {"order_id": "O4", "status": "open", "amount": 130.0}}]}
+{"tx_id": "t5", "events": [{"op": "update", "table": "orders", "key": {"order_id": "O3"}, "before": {"order_id": "O3", "status": "shipped", "amount": 50.0}, "after": {"order_id": "O3", "status": "shipped", "amount": 60.0}}]}
+{"tx_id": "t6", "events": [{"op": "insert", "table": "orders", "key": {"order_id": "O6"}, "after": {"order_id": "O6", "status": "paid", "amount": 40.0}}]}

@@ -34,15 +34,32 @@ class SearchState:
     calls_used: int = 0
     max_calls: int = 0
     status: str = "INIT"  # INIT / BASELINE_CONFIRMED / RUNNING / INTERRUPTED /
-    #                       BUDGET_EXHAUSTED / CERTIFIED / BASELINE_REJECTED
-    phase: str = "baseline"  # baseline / batch / row / done
+    #                       BUDGET_EXHAUSTED / CERTIFIED / BASELINE_REJECTED /
+    #                       BLOCKED
+    phase: str = "baseline"  # baseline / empty_probe / batch / row|tx / done
+    # Search mode: "tables" (static row deletion) or "log" (CDC tx deletion).
+    # Old state files without this field are tables-mode searches.
+    mode: str = "tables"
     # ddmin bookkeeping (deterministically reconstructable; stored for resume)
     current_ids: list[str] = field(default_factory=list)
     k: int = 2
     row_index: int = 0
+    # Log-mode bookkeeping: original changes.jsonl path, input binding hashes
+    # and the currently kept original transaction positions.
+    changes_path: str = ""
+    snapshot_hash: str = ""
+    log_hash: str = ""
+    schema_hash: str = ""
+    current_keep: list[int] = field(default_factory=list)
+    tx_index: int = 0
+    # Oracle behavior configuration recorded when the search started; resume
+    # refuses to reuse conclusions if the behavior config changed meanwhile.
+    # (max_calls is a budget, not behavior, and may grow on resume.)
+    oracle_behavior: dict[str, Any] = field(default_factory=dict)
     # Final result (when certified)
     result_hash: str | None = None
     result_ids: list[str] = field(default_factory=list)
+    result_tx_ids: list[Any] = field(default_factory=list)
     certificate_path: str | None = None
     note: str = ""
 
@@ -57,11 +74,20 @@ class SearchState:
             "max_calls": self.max_calls,
             "status": self.status,
             "phase": self.phase,
+            "mode": self.mode,
             "k": self.k,
             "row_index": self.row_index,
             "current_ids": self.current_ids,
+            "changes_path": self.changes_path,
+            "snapshot_hash": self.snapshot_hash,
+            "log_hash": self.log_hash,
+            "schema_hash": self.schema_hash,
+            "current_keep": self.current_keep,
+            "tx_index": self.tx_index,
+            "oracle_behavior": self.oracle_behavior,
             "result_hash": self.result_hash,
             "result_ids": self.result_ids,
+            "result_tx_ids": self.result_tx_ids,
             "certificate_path": self.certificate_path,
             "note": self.note,
         }

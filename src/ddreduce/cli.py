@@ -1,9 +1,11 @@
-"""Command line interface: reduce, resume, verify.
+"""Command line interface: reduce, resume, verify, log-replay, log-reduce, log-verify.
 
 Exit codes:
-  0  CERTIFIED (reduce/resume) or VERIFIED_MINIMAL (verify)
-  2  baseline rejected / certificate REJECTED / non-minimal neighbor found
-  3  budget exhausted
+  0  CERTIFIED (reduce/resume/log-reduce) or VERIFIED_MINIMAL (verify/log-verify);
+     log-replay: the log is valid and the replay report was produced
+  2  baseline rejected / certificate REJECTED / non-minimal or unknown neighbor /
+     invalid change log
+  3  call budget exhausted
   4  interrupted
   1  any other tool error (bad arguments, invalid schema/data, ...)
 """
@@ -18,9 +20,14 @@ import threading
 from pathlib import Path
 
 from .engine import BaselineRejected, BudgetExhausted, Reducer, SearchInterrupted
-from .oracle import OracleConfig, OracleConfigError
-from .schema import Schema, load_schema
+from .logengine import LogReducer
+from .logmodel import ChangeLog, LogContractError, load_changelog
+from .logverify import LogVerifier, write_log_report
 from .model import Database
+from .oracle import OracleConfig, OracleConfigError
+from .replay import validate_log_inputs
+from .schema import Schema, load_schema
+from .state import SearchState
 from .values import DataError, SchemaError
 from .verify import Verifier, write_report
 
@@ -40,6 +47,28 @@ def _load_pieces(args: argparse.Namespace) -> tuple[Schema, Database, OracleConf
     config = OracleConfig.load(args.oracle_config, overrides)
     db = Database.load(schema, args.input)
     return schema, db, config
+
+
+def _oracle_overrides(args: argparse.Namespace) -> dict:
+    return {
+        k: v
+        for k, v in {
+            "timeout_seconds": getattr(args, "timeout", None),
+            "retest_runs": getattr(args, "retest_runs", None),
+            "confirm_runs": getattr(args, "confirm_runs", None),
+            "max_calls": getattr(args, "max_calls", None),
+        }.items()
+        if v is not None
+    }
+
+
+def _load_validated_log(args: argparse.Namespace):
+    """Load schema/snapshot/log and validate the original log (no oracle yet)."""
+    schema = load_schema(args.schema)
+    schema_text = Path(args.schema).read_text(encoding="utf-8")
+    snapshot = Database.load(schema, args.snapshot)
+    log = load_changelog(args.changes, schema)
+    return validate_log_inputs(schema, schema_text, snapshot, log)
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> None:
@@ -99,6 +128,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
             raise DataError(f"no search state found in {args.workdir}")
         with open(store_path, "r", encoding="utf-8") as fh:
             state_raw = json.load(fh)
+        mode = state_raw.get("mode", "tables")
+        if mode == "log":
+            return _resume_log(args, state_raw, stop_event)
         schema = load_schema(state_raw["schema_path"])
         config = OracleConfig.load(state_raw["oracle_config_path"])
         db = Database.load(schema, state_raw["input_dir"])
@@ -114,7 +146,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             budget_override=args.max_calls,
         )
         state = reducer.run()
-    except (OracleConfigError, SchemaError, DataError, BaselineRejected) as exc:
+    except (OracleConfigError, SchemaError, DataError, LogContractError, BaselineRejected) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     except BudgetExhausted:
@@ -138,8 +170,55 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 2
 
 
+def _resume_log(
+    args: argparse.Namespace, state_raw: dict, stop_event: threading.Event
+) -> int:
+    """Resume a log-mode search; the state file records every input path."""
+    schema = load_schema(state_raw["schema_path"])
+    schema_text = Path(state_raw["schema_path"]).read_text(encoding="utf-8")
+    snapshot = Database.load(schema, state_raw["input_dir"])
+    log = load_changelog(state_raw["changes_path"], schema)
+    validated = validate_log_inputs(schema, schema_text, snapshot, log)
+    config = OracleConfig.load(state_raw["oracle_config_path"])
+    reducer = LogReducer(
+        validated=validated,
+        config=config,
+        work_dir=args.workdir,
+        snapshot_dir=state_raw["input_dir"],
+        changes_path=state_raw["changes_path"],
+        schema_path=state_raw["schema_path"],
+        config_path=state_raw["oracle_config_path"],
+        stop_event=stop_event,
+        budget_override=args.max_calls,
+    )
+    state = reducer.run()
+    if state.status == "CERTIFIED":
+        print(f"RESUMED and CERTIFIED: {state.certificate_path}")
+        print(f"transactions kept: {len(state.result_tx_ids)}; calls used: {state.calls_used}")
+        return 0
+    if state.status == "BUDGET_EXHAUSTED":
+        print("BUDGET EXHAUSTED", file=sys.stderr)
+        return 3
+    if state.status == "BLOCKED":
+        print(f"BLOCKED: {state.note}", file=sys.stderr)
+        return 2
+    if state.status == "INTERRUPTED":
+        print("INTERRUPTED", file=sys.stderr)
+        return 4
+    print(f"NOT CERTIFIED: {state.status} {state.note}", file=sys.stderr)
+    return 2
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     try:
+        cert_path = Path(args.workdir) / "certificate.json"
+        if cert_path.exists():
+            with open(cert_path, "r", encoding="utf-8") as fh:
+                mode = json.load(fh).get("mode", "tables")
+            if mode == "log":
+                raise DataError(
+                    "workdir holds a CDC log certificate; use 'log-verify' instead"
+                )
         schema = load_schema(args.schema)
         config = OracleConfig.load(args.oracle_config)
         if args.max_calls is not None:
@@ -149,7 +228,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
         target = args.signature
         result_dir = args.result_dir
         if target is None or result_dir is None:
-            cert_path = Path(args.workdir) / "certificate.json"
             if not cert_path.exists():
                 raise DataError(
                     "certificate.json not found; pass --signature and --result-dir explicitly"
@@ -183,10 +261,147 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 2
 
 
+# =================================================================== log mode
+def cmd_log_reduce(args: argparse.Namespace) -> int:
+    stop_event = threading.Event()
+    _install_signal_handlers(stop_event)
+    try:
+        validated = _load_validated_log(args)
+        config = OracleConfig.load(args.oracle_config, _oracle_overrides(args))
+        reducer = LogReducer(
+            validated=validated,
+            config=config,
+            work_dir=args.workdir,
+            snapshot_dir=args.snapshot,
+            changes_path=args.changes,
+            schema_path=args.schema,
+            config_path=args.oracle_config,
+            stop_event=stop_event,
+        )
+        state = reducer.run()
+    except (OracleConfigError, SchemaError, DataError, LogContractError, BaselineRejected) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except BudgetExhausted as exc:
+        print(f"BUDGET EXHAUSTED: {exc}", file=sys.stderr)
+        return 3
+    except SearchInterrupted:
+        print("INTERRUPTED: state saved; use 'resume' to continue", file=sys.stderr)
+        return 4
+
+    if state.status == "CERTIFIED":
+        print(f"CERTIFIED 1-minimal CDC package: {state.certificate_path}")
+        print(
+            f"transactions kept: {len(state.result_tx_ids)} "
+            f"({state.result_tx_ids}); calls used: {state.calls_used}"
+        )
+        return 0
+    if state.status == "BUDGET_EXHAUSTED":
+        print("BUDGET EXHAUSTED", file=sys.stderr)
+        return 3
+    if state.status == "INTERRUPTED":
+        print("INTERRUPTED", file=sys.stderr)
+        return 4
+    print(f"NOT CERTIFIED: {state.status} {state.note}", file=sys.stderr)
+    return 2
+
+
+def cmd_log_replay(args: argparse.Namespace) -> int:
+    """Replay (and optionally normalize) a log without running any oracle."""
+    try:
+        validated = _load_validated_log(args)
+        if args.selection:
+            with open(args.selection, "r", encoding="utf-8") as fh:
+                sel_doc = json.load(fh)
+            selection = _parse_selection(sel_doc, validated.log)
+        else:
+            selection = {tx.position for tx in validated.log}
+        normalized = validated.normalize(selection)
+    except (SchemaError, DataError, LogContractError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        print(f"ERROR: invalid selection file: {exc}", file=sys.stderr)
+        return 1
+
+    candidate = validated.candidate(normalized.committed)
+    report = {
+        "valid": True,
+        "tx_count": len(validated.log),
+        "selection": sorted(selection),
+        "committed_positions": list(normalized.committed),
+        "committed_tx_ids": candidate.tx_ids(),
+        "transactions": [d.to_dict() for d in normalized.dispositions],
+        "final": {
+            "table_counts": normalized.final_database().table_counts(),
+            "state_hash": normalized.state_hash(),
+        },
+        "candidate_hash": candidate.content_hash(),
+    }
+    if args.out:
+        candidate.materialize(args.out)
+        report["candidate_dir"] = str(args.out)
+    text = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2)
+    if args.report:
+        Path(args.report).write_text(text + "\n", encoding="utf-8")
+    print(text)
+    return 0
+
+
+def _parse_selection(sel_doc: dict, log: ChangeLog) -> set[int]:
+    if not isinstance(sel_doc, dict):
+        raise ValueError("selection must be a JSON object")
+    by_id = {json.dumps(tx.tx_id): tx.position for tx in log}
+
+    def _positions(ids):
+        out = set()
+        for tx_id in ids:
+            token = json.dumps(tx_id)
+            if token not in by_id:
+                raise ValueError(f"unknown tx_id in selection: {tx_id!r}")
+            out.add(by_id[token])
+        return out
+
+    if "keep" in sel_doc:
+        return _positions(sel_doc["keep"])
+    if "drop" in sel_doc:
+        return {tx.position for tx in log} - _positions(sel_doc["drop"])
+    raise ValueError("selection file needs a 'keep' or 'drop' list of tx_ids")
+
+
+def cmd_log_verify(args: argparse.Namespace) -> int:
+    try:
+        config = OracleConfig.load(args.oracle_config)
+        if args.max_calls is not None:
+            config = OracleConfig.load(args.oracle_config, {"max_calls": args.max_calls})
+        verifier = LogVerifier(
+            config=config,
+            work_dir=Path(args.workdir) / "verify-runs",
+            use_cache=not args.no_cache,
+        )
+        report = verifier.verify_certificate(args.workdir, config.max_calls)
+        out_path = Path(args.workdir) / "log-verify-report.json"
+        write_log_report(report, out_path)
+    except (OracleConfigError, SchemaError, DataError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"{report.verdict}: {out_path}")
+    print(
+        f"neighbors tested: {len(report.neighbors)}; "
+        f"calls: {report.calls_used}; cache hits: {report.cache_hits}"
+    )
+    if report.verdict == "VERIFIED_MINIMAL":
+        return 0
+    if report.verdict == "BUDGET_EXHAUSTED":
+        return 3
+    return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ddreduce",
-        description="Failure-input reducer for relational JSONL data",
+        description="Failure-input reducer for relational JSONL data and CDC change logs",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -204,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_reduce.set_defaults(func=cmd_reduce)
 
     p_resume = sub.add_parser(
-        "resume", help="resume an interrupted search from its workdir"
+        "resume", help="resume an interrupted search from its workdir (auto-detects mode)"
     )
     p_resume.add_argument("--workdir", required=True)
     p_resume.add_argument(
@@ -220,6 +435,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--result-dir", default=None)
     p_verify.add_argument("--no-cache", action="store_true")
     p_verify.set_defaults(func=cmd_verify)
+
+    log_common = argparse.ArgumentParser(add_help=False)
+    log_common.add_argument("--snapshot", required=True, help="fixed snapshot dir of JSONL tables")
+    log_common.add_argument("--schema", required=True, help="schema JSON file")
+    log_common.add_argument("--changes", required=True, help="original changes.jsonl")
+
+    p_log_reduce = sub.add_parser(
+        "log-reduce", parents=[log_common], help="reduce a CDC transaction history"
+    )
+    p_log_reduce.add_argument("--oracle-config", required=True, help="oracle config JSON")
+    p_log_reduce.add_argument("--workdir", required=True, help="tool state / cache / result dir")
+    p_log_reduce.add_argument("--timeout", type=float, default=None)
+    p_log_reduce.add_argument("--retest-runs", type=int, default=None)
+    p_log_reduce.add_argument("--confirm-runs", type=int, default=None)
+    p_log_reduce.add_argument("--max-calls", type=int, default=None)
+    p_log_reduce.set_defaults(func=cmd_log_reduce)
+
+    p_log_replay = sub.add_parser(
+        "log-replay",
+        parents=[log_common],
+        help="replay/normalize a change log without running the oracle",
+    )
+    p_log_replay.add_argument(
+        "--selection",
+        default=None,
+        help="JSON file with {'keep': [tx_id,...]} or {'drop': [tx_id,...]}",
+    )
+    p_log_replay.add_argument("--out", default=None, help="write the normalized candidate package here")
+    p_log_replay.add_argument("--report", default=None, help="also write the replay report JSON here")
+    p_log_replay.set_defaults(func=cmd_log_replay)
+
+    p_log_verify = sub.add_parser(
+        "log-verify", help="independently verify a CDC history certificate"
+    )
+    p_log_verify.add_argument("--workdir", required=True)
+    p_log_verify.add_argument("--oracle-config", required=True, help="oracle config JSON")
+    p_log_verify.add_argument("--max-calls", type=int, default=None)
+    p_log_verify.add_argument("--no-cache", action="store_true")
+    p_log_verify.set_defaults(func=cmd_log_verify)
     return parser
 
 

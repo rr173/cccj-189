@@ -6,14 +6,22 @@ re-restores the requested window itself, then compares every artifact of the
 package against its own independent result:
 
 * ``schema.json`` and ``snapshot/`` are compared against the schema and
-  snapshot paths given on the command line;
+  snapshot paths given on the command line (for capture-v2 the snapshot is
+  compared against an independent conversion, since it is re-expressed in the
+  unified target schema rather than copied);
 * ``changes.jsonl`` is compared line-for-line against the independently
   restored full-image transactions;
 * ``capture-map.jsonl`` is rebuilt from the spill database (all transport
   coordinates included) and compared entry-for-entry;
-* ``capture-report.json`` bindings, window, hashes and counts are recomputed.
+* ``capture-report.json`` bindings, window, hashes, counts, and - for a
+  schema-evolving archive - the schema-history and unified-target sections are
+  recomputed; a doctored history hash is a package mismatch.
 
-Three failure classes stay distinct in the report:
+For capture-v2 the verifier also re-runs the commit-boundary check and
+compares the schema version each exported transaction claims in the map with
+the version in force at its commit point.
+
+Failure classes stay distinct in the report:
 
 * ``ARCHIVE_INVALID``  - the source archive itself is incomplete/conflicting;
 * ``RESTORE_FAILED``   - a valid archive cannot be restored against the
@@ -34,14 +42,24 @@ from typing import Any
 from ..model import Database
 from ..schema import load_schema
 from ..values import canonical_json
-from .errors import CaptureArchiveError, CaptureError, CapturePackageError, CaptureRestoreError
+from .errors import (
+    CaptureArchiveError,
+    CaptureError,
+    CapturePackageError,
+    CaptureRestoreError,
+    CaptureSchemaHistoryError,
+)
+from .evolve import load_versioned_snapshot
 from .importer import (
     MAP_FORMAT,
     PACKAGE_FILES,
     REPORT_FORMAT,
     archive_hash,
+    bindings_report,
+    check_commit_version_boundary,
     hash_bytes,
     hash_file,
+    history_report_section,
 )
 from .manifest import load_manifest
 from .restore import Restorer
@@ -95,7 +113,10 @@ def _rebuild_map_and_changes(
     manifest, schema, snapshot, store, through: int
 ) -> tuple[list[str], list[str], dict[str, int]]:
     """Independent restoration; returns (changes lines, map lines, counters)."""
-    restorer = Restorer(manifest, schema, list(snapshot.rows.values()))
+    restorer = Restorer(
+        manifest, schema, list(snapshot.rows.values()), history=manifest.history
+    )
+    check_commit_version_boundary(manifest, store)
     changes_lines: list[str] = []
     map_lines: list[str] = []
     counters = {
@@ -105,6 +126,11 @@ def _rebuild_map_and_changes(
         "exported_events": 0,
         "key_move_expansions": 0,
     }
+    if manifest.history is not None:
+        counters["commits_version_checked"] = len(
+            [e for e in store.committed_transactions()
+             if store.logical_events(e.tx_id)]
+        )
     output_position = -1
     for end in store.committed_transactions():
         seq = end.commit_seq
@@ -156,6 +182,8 @@ def _rebuild_map_and_changes(
                     "source_table": src.source_table,
                     "source_op": src.op,
                     "expanded_from_key_move": src.expanded_from_key_move,
+                    "schema_version": src.schema_version,
+                    "backfilled_columns": list(src.backfilled),
                     "coordinates": _coords(src.coordinates),
                 },
                 "end_coordinates": _coords(end.coordinates),
@@ -170,7 +198,7 @@ def _expected_report(
     schema_path: Path, package_dir: Path, through: int,
     changes_lines: list[str], map_lines: list[str], counters: dict,
 ) -> dict[str, Any]:
-    return {
+    report = {
         "format": REPORT_FORMAT,
         "archive": {
             "path": str(Path(archive)),
@@ -193,7 +221,7 @@ def _expected_report(
                 canonical_json(schema.canonical()).encode("utf-8")
             ),
         },
-        "bindings": manifest.raw["bindings"],
+        "bindings": bindings_report(manifest),
         "window": {
             "snapshot_commit_seq": manifest.snapshot_commit_seq,
             "sealed_commit_seq": manifest.sealed_commit_seq,
@@ -218,6 +246,7 @@ def _expected_report(
             "exported_transactions": counters["exported_transactions"],
             "exported_events": counters["exported_events"],
             "key_move_expansions": counters["key_move_expansions"],
+            "commits_version_checked": counters.get("commits_version_checked", 0),
         },
         "output": {
             "directory": str(Path(package_dir)),
@@ -229,6 +258,11 @@ def _expected_report(
             ),
         },
     }
+    history_section = history_report_section(manifest, schema)
+    if history_section is not None:
+        report["schema_history"] = history_section["history"]
+        report["target_schema"] = history_section["target"]
+    return report
 
 
 def _normalize_expected_report(expected: dict, actual: dict) -> dict:
@@ -293,6 +327,7 @@ def run_verify(
     package_dir: str | Path,
     *,
     tmp_root: str | Path | None = None,
+    history_path: str | Path | None = None,
 ) -> VerificationResult:
     archive = Path(archive)
     snapshot_dir = Path(snapshot_dir)
@@ -324,6 +359,7 @@ def run_verify(
     try:
         schema = load_schema(schema_path)
         manifest = load_manifest(archive, schema)
+        _check_history_argument(manifest, history_path)
         if isinstance(through, bool) or not isinstance(through, int) or through < 0:
             raise CaptureError("--through must be a non-negative integer")
         if not (manifest.snapshot_commit_seq <= through <= manifest.sealed_commit_seq):
@@ -331,7 +367,7 @@ def run_verify(
                 f"--through {through} outside the archive window "
                 f"[{manifest.snapshot_commit_seq}, {manifest.sealed_commit_seq}]"
             )
-        snapshot = Database.load(schema, snapshot_dir)
+        snapshot = _load_snapshot(manifest, schema, snapshot_dir)
         with CaptureStore(manifest, schema, archive, tmp_root=tmp_root) as store:
             store.scan()
             store.assemble()
@@ -343,16 +379,23 @@ def run_verify(
                 schema_path, package_dir, through, changes_lines, map_lines,
                 counters,
             )
+    except CaptureSchemaHistoryError as exc:
+        result.verdict = VERDICT_ARCHIVE
+        result.add(VERDICT_ARCHIVE, f"schema history: {exc}", **exc.locator)
+        result.report = _base_report(
+            result, archive, snapshot_dir, schema_path, package_dir, through
+        )
+        return result
     except CaptureArchiveError as exc:
         result.verdict = VERDICT_ARCHIVE
-        result.add(VERDICT_ARCHIVE, str(exc))
+        result.add(VERDICT_ARCHIVE, str(exc), **exc.locator)
         result.report = _base_report(
             result, archive, snapshot_dir, schema_path, package_dir, through
         )
         return result
     except CaptureRestoreError as exc:
         result.verdict = VERDICT_RESTORE
-        result.add(VERDICT_RESTORE, str(exc))
+        result.add(VERDICT_RESTORE, str(exc), **exc.locator)
         result.report = _base_report(
             result, archive, snapshot_dir, schema_path, package_dir, through
         )
@@ -368,7 +411,11 @@ def run_verify(
     # The archive restores cleanly.  Compare the package artifacts only when
     # its five-part layout is actually present.
     if not layout_broken:
-        _compare_static_artifacts(result, schema_path, snapshot_dir, package_dir)
+        _compare_static_artifacts(
+            result, schema_path, snapshot_dir, package_dir, manifest, schema,
+            snapshot,
+        )
+        _compare_transaction_boundaries(result, package_dir, manifest)
         _compare_jsonl(result, package_dir / "changes.jsonl", changes_lines,
                        "changes.jsonl", kind="changes")
         _compare_jsonl(result, package_dir / "capture-map.jsonl", map_lines,
@@ -396,9 +443,105 @@ def run_verify(
     return result
 
 
+def _check_history_argument(
+    manifest, history_path: str | Path | None
+) -> None:
+    if not manifest.evolving:
+        if history_path is not None:
+            raise CaptureSchemaHistoryError(
+                "a schema history was supplied for a capture-v1 archive; "
+                "capture-v1 archives have a single schema and carry no history"
+            )
+        return
+    if history_path is None:
+        raise CaptureSchemaHistoryError(
+            "this archive declares an ordered schema history; pass "
+            "--schema-history with the same history it was sealed with"
+        )
+    from .history import load_schema_history
+
+    supplied = load_schema_history(history_path)
+    if supplied.content_hash() != manifest.history.content_hash():
+        raise CaptureSchemaHistoryError(
+            f"supplied schema history {history_path} does not match the "
+            f"archive's schema history (manifest history_hash "
+            f"{manifest.raw['history_hash']})"
+        )
+
+
+def _load_snapshot(manifest, schema, snapshot_dir: Path) -> Database:
+    if manifest.evolving:
+        return load_versioned_snapshot(manifest.history, schema, snapshot_dir)
+    return Database.load(schema, snapshot_dir)
+
+
+def _compare_transaction_boundaries(
+    result: VerificationResult, package_dir: Path, manifest
+) -> None:
+    """Verify the per-transaction schema-version provenance in the map.
+
+    Every exported transaction must have been interpreted with exactly one
+    schema version, and that version must be the one in force at its commit
+    point.  The map's claimed versions are compared with the independently
+    recomputed switch boundaries rather than trusted.
+    """
+    history = manifest.history
+    if history is None:
+        return
+    map_path = package_dir / "capture-map.jsonl"
+    try:
+        rows = _read_jsonl(map_path)
+    except CapturePackageError:
+        return  # already reported by the map comparison
+    versions_seen: dict[Any, set] = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get("zero_event_commit"):
+            continue
+        source = row.get("source") or {}
+        versions_seen.setdefault(row.get("tx_id"), set()).add(
+            source.get("schema_version")
+        )
+    switch = {seq: version
+              for version, seq in history.switch_points()}
+    for tx_id, versions in sorted(versions_seen.items(),
+                                  key=lambda kv: str(kv[0])):
+        if len(versions) > 1:
+            result.add(
+                VERDICT_PACKAGE,
+                f"tx {tx_id!r}: output events claim several schema versions "
+                f"{sorted(v for v in versions if v is not None)}",
+                file="capture-map.jsonl", tx_id=str(tx_id),
+            )
+            continue
+        version = next(iter(versions))
+        if version is None:
+            continue
+        seq = _commit_seq_for(result, rows, tx_id)
+        if seq is None:
+            continue
+        expected_version = history.for_commit(seq).version
+        if version != expected_version:
+            result.add(
+                VERDICT_PACKAGE,
+                f"tx {tx_id!r}: events converted with schema version {version} "
+                f"but commit_seq {seq} requires version {expected_version}",
+                file="capture-map.jsonl", tx_id=str(tx_id),
+                commit_seq=seq, version=version,
+            )
+
+
+def _commit_seq_for(result: VerificationResult, rows: list, tx_id) -> int | None:
+    for row in rows:
+        if isinstance(row, dict) and row.get("tx_id") == tx_id:
+            seq = row.get("commit_seq")
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                return seq
+    return None
+
+
 def _compare_static_artifacts(
     result: VerificationResult, schema_path: Path, snapshot_dir: Path,
-    package_dir: Path,
+    package_dir: Path, manifest=None, schema=None, snapshot=None,
 ) -> None:
     # The importer copies the schema text verbatim, only guaranteeing a
     # trailing newline; compare parsed JSON content rather than raw bytes.
@@ -420,6 +563,9 @@ def _compare_static_artifacts(
     if not pkg_snapshot.is_dir():
         result.add(VERDICT_PACKAGE, "package snapshot/ is not a directory")
         return
+    if manifest is not None and manifest.evolving:
+        _compare_converted_snapshot(result, pkg_snapshot, snapshot)
+        return
     pkg_files = {p.name for p in pkg_snapshot.iterdir() if p.is_file()}
     src_files = {p.name for p in snapshot_dir.iterdir() if p.is_file()}
     if pkg_files != src_files:
@@ -436,6 +582,68 @@ def _compare_static_artifacts(
                 VERDICT_PACKAGE,
                 f"snapshot table {name!r} content differs from the source snapshot",
                 file=f"snapshot/{name}",
+            )
+
+
+def _compare_converted_snapshot(
+    result: VerificationResult, pkg_snapshot: Path, expected
+) -> None:
+    """capture-v2 snapshots are converted, not copied: compare row content.
+
+    The package snapshot must be the initial-version snapshot re-expressed in
+    the unified target schema: renamed fields in their target columns and
+    every later-added field carrying its declared backfill.  It is *not*
+    byte-equal to the raw source snapshot, so the comparison is by parsed
+    target-schema row.
+    """
+    if expected is None:
+        return
+    pkg_files = {p.name for p in pkg_snapshot.iterdir() if p.is_file()}
+    expected_files = {f"{t}.jsonl" for t in expected.schema.tables}
+    if pkg_files != expected_files:
+        result.add(
+            VERDICT_PACKAGE,
+            f"snapshot file set differs: package {sorted(pkg_files)} vs "
+            f"independent conversion {sorted(expected_files)}",
+            file="snapshot/",
+        )
+        return
+    for table_name in sorted(expected.schema.tables):
+        want = sorted(
+            canonical_json(row.data)
+            for row in expected.rows.values() if row.table == table_name
+        )
+        got_rows = []
+        try:
+            for line_no, line in enumerate(
+                (pkg_snapshot / f"{table_name}.jsonl").read_text("utf-8")
+                .splitlines(), 1
+            ):
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise CapturePackageError(
+                        f"snapshot/{table_name}.jsonl:{line_no}: row must be "
+                        "an object"
+                    )
+                got_rows.append(canonical_json(obj))
+        except (OSError, json.JSONDecodeError, CapturePackageError) as exc:
+            result.add(
+                VERDICT_PACKAGE, f"snapshot/{table_name}.jsonl unreadable: {exc}",
+                file=f"snapshot/{table_name}.jsonl",
+            )
+            continue
+        got_rows.sort()
+        if got_rows != want:
+            missing = [r for r in want if r not in got_rows][:2]
+            extra = [r for r in got_rows if r not in want][:2]
+            result.add(
+                VERDICT_PACKAGE,
+                f"snapshot table {table_name!r} does not match the independent "
+                "conversion (renamed fields, backfilled columns)",
+                file=f"snapshot/{table_name}.jsonl",
+                missing=missing, unexpected=extra,
             )
 
 
@@ -484,8 +692,30 @@ def _compare_report(
         )
     want = _normalize_expected_report(expected, actual)
     got = _resolve_report_paths(actual)
-    # Compare section by section so tampering is located precisely.
-    for section in ("archive", "inputs", "bindings", "window", "counts", "output"):
+    # Compare section by section so tampering is located precisely.  The
+    # schema-history and unified-target sections bind a capture-v2 package to
+    # the history it was converted from; a doctored hash must be caught here.
+    sections = ["archive", "inputs", "bindings", "window", "counts", "output"]
+    if "schema_history" in expected:
+        sections.extend(["schema_history", "target_schema"])
+    for section in ("schema_history", "target_schema"):
+        if section in expected and section not in actual:
+            result.add(
+                VERDICT_PACKAGE,
+                f"capture-report.json is missing the {section!r} section that "
+                "binds this schema-evolving package",
+                file="capture-report.json", section=section,
+            )
+    if "schema_history" not in expected:
+        for section in ("schema_history", "target_schema"):
+            if section in actual:
+                result.add(
+                    VERDICT_PACKAGE,
+                    f"capture-report.json declares {section!r} but the archive "
+                    "has no schema history (capture-v1)",
+                    file="capture-report.json", section=section,
+                )
+    for section in sections:
         if got.get(section) != want.get(section):
             result.add(
                 VERDICT_PACKAGE,

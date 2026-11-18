@@ -1,0 +1,27 @@
+{
+  "tables": [
+    {
+      "columns": [
+        {
+          "name": "key",
+          "nullable": false,
+          "type": "string"
+        },
+        {
+          "name": "amount",
+          "nullable": false,
+          "type": "float"
+        },
+        {
+          "name": "currency",
+          "nullable": false,
+          "type": "string"
+        }
+      ],
+      "name": "accounts",
+      "primary_key": [
+        "key"
+      ]
+    }
+  ]
+}

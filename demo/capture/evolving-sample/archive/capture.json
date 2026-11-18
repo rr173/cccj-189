@@ -1,0 +1,19 @@
+{
+  "files": [
+    "shards/s1-00.jsonl",
+    "shards/s1-01.jsonl"
+  ],
+  "history_hash": "c8cd37a0d9a858020b96461ceda45aba7228acfb3d13cb35ff975c7687ac8c89",
+  "schema_history": "schema-history.json",
+  "sealed_commit_seq": 2,
+  "snapshot_commit_seq": 0,
+  "source_id": "src-evolving-1",
+  "streams": [
+    {
+      "first_offset": 0,
+      "last_offset": 3,
+      "name": "s1"
+    }
+  ],
+  "version": 2
+}

@@ -60,6 +60,21 @@ class LogicalEvent:
     after: dict[str, Any] | None
     new_key: dict[str, Any] | None
     coordinates: tuple[Coordinate, ...]
+    schema_version: int | None = None  # declared write schema (capture-v2 only)
+
+    def where(self) -> str:
+        """Stable source coordinate for error reports.
+
+        Names the logical position *and* the first transport coordinate, so a
+        rejected row image can be found in the archive.
+        """
+        base = f"tx {self.tx_id!r} tx_order {self.tx_order}"
+        if self.coordinates:
+            first = self.coordinates[0]
+            base += f" at {first.stream}@{first.offset}"
+        if self.schema_version is not None:
+            base += f" (schema_version {self.schema_version})"
+        return base
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,7 @@ CREATE TABLE logical_events (
     event_id        INTEGER PRIMARY KEY AUTOINCREMENT,
     tx_id           TEXT NOT NULL,
     tx_order        INTEGER NOT NULL,
+    schema_version  INTEGER,
     business_canon  TEXT NOT NULL,
     payload         TEXT NOT NULL,
     UNIQUE (tx_id, tx_order, business_canon)
@@ -225,7 +241,21 @@ class CaptureStore:
                     raise CaptureArchiveError(
                         f"{rel}:{line_no}: invalid JSON ({exc})"
                     ) from exc
-                validate_message(obj, self.manifest, self.schema, rel, line_no)
+                try:
+                    validate_message(
+                        obj, self.manifest, self.schema, rel, line_no
+                    )
+                except CaptureArchiveError as exc:
+                    exc.with_locator(
+                        file=rel, line=line_no,
+                        stream=obj.get("stream") if isinstance(obj, dict) else None,
+                        offset=obj.get("offset") if isinstance(obj, dict) else None,
+                        tx_id=obj.get("tx_id") if isinstance(obj, dict) else None,
+                        tx_order=obj.get("tx_order") if isinstance(obj, dict) else None,
+                        schema_version=obj.get("schema_version")
+                        if isinstance(obj, dict) else None,
+                    )
+                    raise
                 self._ingest(obj)
 
     def _ingest(self, msg: dict[str, Any]) -> None:
@@ -288,11 +318,11 @@ class CaptureStore:
                     "different coordinates; cannot choose one"
                 )
             cur = conn.execute(
-                "INSERT INTO logical_events(tx_id, tx_order, business_canon, payload) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO logical_events(tx_id, tx_order, schema_version, "
+                "business_canon, payload) VALUES (?, ?, ?, ?, ?)",
                 (
-                    msg["tx_id"], msg["tx_order"], biz_canon,
-                    json.dumps(msg, ensure_ascii=False),
+                    msg["tx_id"], msg["tx_order"], msg.get("schema_version"),
+                    biz_canon, json.dumps(msg, ensure_ascii=False),
                 ),
             )
             event_id = cur.lastrowid
@@ -416,7 +446,8 @@ class CaptureStore:
             "SELECT end_id, kind, payload FROM tx_ends WHERE tx_id=?", (tx_id,)
         ).fetchall()
         event_rows = conn.execute(
-            "SELECT event_id, payload FROM logical_events WHERE tx_id=? ORDER BY tx_order",
+            "SELECT event_id, payload FROM logical_events WHERE tx_id=? "
+            "ORDER BY tx_order",
             (tx_id,),
         ).fetchall()
         if not ends:
@@ -443,6 +474,16 @@ class CaptureStore:
             raise CaptureArchiveError(
                 f"transaction {tx_id!r}: tx_order must be exactly 1..event_count "
                 f"(1..{event_count}); found {orders}"
+            )
+
+        # A schema switch happens at a transaction commit boundary: one
+        # transaction can never contain events written under two versions.
+        versions = {json.loads(p).get("schema_version") for _, p in event_rows}
+        if len(versions) > 1:
+            raise CaptureArchiveError(
+                f"transaction {tx_id!r}: events declare conflicting schema "
+                f"versions {sorted(v for v in versions if v is not None)}; a "
+                "transaction cannot straddle a schema switch"
             )
 
         # table_counts must accurately count logical row changes per source table.
@@ -543,6 +584,7 @@ class CaptureStore:
                     after=payload.get("after"),
                     new_key=payload.get("new_key"),
                     coordinates=coords,
+                    schema_version=payload.get("schema_version"),
                 )
             )
         return out

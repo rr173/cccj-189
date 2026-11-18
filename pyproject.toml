@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ddreduce"
 version = "1.2.0"
-description = "Failure-input reducer for relational JSONL data and CDC transaction histories (1-minimal repro packages), with offline capture-v1 ingestion"
+description = "Failure-input reducer for relational JSONL data and CDC transaction histories (1-minimal repro packages), with offline capture-v1/v2 ingestion (schema history)"
 requires-python = ">=3.11"
 dependencies = []
 

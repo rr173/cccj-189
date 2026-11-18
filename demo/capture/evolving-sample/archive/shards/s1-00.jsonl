@@ -1,0 +1,2 @@
+{"commit_seq": 2, "event_count": 1, "kind": "commit", "offset": 3, "source_id": "src-evolving-1", "stream": "s1", "table_counts": {"accounts": 1}, "tx_id": "B"}
+{"after": {"gross": 20}, "before": {"gross": 10}, "key": {"key": "k"}, "kind": "change", "offset": 0, "op": "update", "schema_version": 1, "source_id": "src-evolving-1", "stream": "s1", "table": "accounts", "tx_id": "A", "tx_order": 1}

@@ -3,11 +3,16 @@
 The restorer consumes logical events in *commit order* (never transport
 order) and rebuilds complete before/after row images in the target schema.
 
-Source columns are renamed through the manifest bindings and every value is
-checked with the existing typed-scalar rules.  Missing columns mean
-*preserve*; an explicit JSON ``null`` means *write null* - the two are never
-confused.  Update events may carry partial images; an empty ``after`` is
-still an update and must not be dropped.
+Each event is interpreted first with the schema version its message declared
+(capture-v2) or with the archive's single binding (capture-v1).  Source
+columns are resolved through that version's table definition and then mapped
+onto the unified target schema by stable field ID, so a rename keeps writing
+the same target column.  A complete image of a version that predates a later
+column receives that column's declared constant backfill.  Every value is
+checked with the version's declared type before widening (int -> float is the
+only widening); missing columns mean *preserve*; an explicit JSON ``null``
+means *write null* - the two are never confused.  Update events may carry
+partial images; an empty ``after`` is still an update and must not be dropped.
 
 Cross-row constraints (unique keys, foreign keys) are evaluated only when the
 whole transaction commits, reusing the existing schema semantics: a
@@ -31,6 +36,8 @@ from ..values import (
     normalize_scalar,
 )
 from .errors import CaptureRestoreError
+from .evolve import VersionLayout, convert_image, convert_key, layout_for
+from .history import SchemaHistory
 from .manifest import Bindings, Manifest
 from .store import LogicalEvent
 
@@ -71,6 +78,14 @@ class EventSource:
     op: str
     coordinates: tuple  # tuple[Coordinate]
     expanded_from_key_move: bool = False
+    schema_version: int | None = None
+    backfilled: tuple[str, ...] = ()  # target columns filled from a backfill
+
+    def coordinate(self) -> str:
+        if not self.coordinates:
+            return "no coordinate"
+        first = self.coordinates[0]
+        return f"{first.stream}@{first.offset}"
 
 
 class _RowStore:
@@ -125,25 +140,57 @@ class _RowStore:
 class Restorer:
     """Applies one transaction's logical events against in-memory row state."""
 
-    def __init__(self, manifest: Manifest, schema: Schema, snapshot_rows: list[Row]):
+    def __init__(
+        self,
+        manifest: Manifest,
+        schema: Schema,
+        snapshot_rows: list[Row],
+        *,
+        history: SchemaHistory | None = None,
+        versions_in_force: dict[int | None, int] | None = None,
+    ):
         self.manifest = manifest
         self.schema = schema
+        self.history = history if history is not None else manifest.history
         self.bindings: Bindings = manifest.bindings
         self.store = _RowStore(schema, snapshot_rows)
         # Target table -> source table, for provenance/error reporting.
         self.source_of_target = {
             b.target_table: b.source_table for b in self.bindings.tables.values()
         }
+        self._layouts: dict[tuple[str, int | None], VersionLayout] = {}
 
     # ------------------------------------------------------------ mappings
+    def layout(self, source_table: str, schema_version: int | None) -> VersionLayout:
+        key = (source_table, schema_version)
+        cached = self._layouts.get(key)
+        if cached is None:
+            cached = layout_for(
+                self.history, self.manifest, self.schema, source_table,
+                schema_version,
+            )
+            self._layouts[key] = cached
+        return cached
+
     def source_pk(self, source_table: str) -> tuple[str, ...]:
-        binding = self.bindings.tables[source_table]
-        target_table = self.schema.tables[binding.target_table]
-        return tuple(
-            binding.target_to_source_columns[col] for col in target_table.primary_key
-        )
+        if self.history is None:
+            binding = self.bindings.tables[source_table]
+            target_table = self.schema.tables[binding.target_table]
+            return tuple(
+                binding.target_to_source_columns[col]
+                for col in target_table.primary_key
+            )
+        # capture-v2: the primary key is version-specific; callers that only
+        # need a structural view get the final version's key.
+        return self.layout(
+            source_table, self.history.versions[-1].version
+        ).source_pk
 
     def _target_table(self, source_table: str) -> TableSchema:
+        if source_table not in self.bindings.tables:
+            raise CaptureRestoreError(
+                f"source table {source_table!r} has no binding"
+            )
         binding = self.bindings.tables[source_table]
         return self.schema.tables[binding.target_table]
 
@@ -153,57 +200,28 @@ class Restorer:
         image: dict[str, Any],
         where: str,
         *,
-        allow_unknown: bool = False,
+        schema_version: int | None = None,
     ) -> dict[str, Any]:
-        """Rename a partial source image into target columns; validate types."""
-        binding = self.bindings.tables[source_table]
-        table = self.schema.tables[binding.target_table]
-        unknown = set(image) - set(binding.columns)
-        if unknown:
-            raise CaptureRestoreError(
-                f"{where}: unknown source columns {sorted(unknown)} on "
-                f"{source_table!r}"
-            )
-        out: dict[str, Any] = {}
-        for source_col, value in image.items():
-            target_col = binding.columns[source_col]
-            column = table.columns[target_col]
-            if value is None:
-                if not column.nullable:
-                    raise CaptureRestoreError(
-                        f"{where}: explicit null in NOT NULL column "
-                        f"{table.name}.{target_col!r}"
-                    )
-                out[target_col] = None
-                continue
-            try:
-                out[target_col] = normalize_scalar(value, column.type)
-            except DataError as exc:
-                raise CaptureRestoreError(
-                    f"{where}: column {table.name}.{target_col!r}: {exc}"
-                ) from exc
-        return out
+        """Rename a partial source image into target columns; validate types.
 
-    def _convert_key(self, source_table: str, source_key: dict, where: str) -> dict[str, Any]:
-        binding = self.bindings.tables[source_table]
-        table = self.schema.tables[binding.target_table]
-        if set(source_key) != set(self.source_pk(source_table)):
-            raise CaptureRestoreError(
-                f"{where}: key columns {sorted(source_key)} do not match the source "
-                f"primary key {sorted(self.source_pk(source_table))}"
-            )
-        target_key: dict[str, Any] = {}
-        for source_col, value in source_key.items():
-            target_col = binding.columns[source_col]
-            try:
-                target_key[target_col] = normalize_scalar(
-                    value, table.columns[target_col].type
-                )
-            except DataError as exc:
-                raise CaptureRestoreError(
-                    f"{where}: key column {table.name}.{target_col!r}: {exc}"
-                ) from exc
-        return target_key
+        Partial images never receive backfill values: a column absent from a
+        partial image means *preserve*, the same as in capture-v1.
+        """
+        layout = self.layout(source_table, schema_version)
+        return convert_image(
+            layout, image, self.schema, where, complete=False
+        )
+
+    def _convert_key(
+        self,
+        source_table: str,
+        source_key: dict,
+        where: str,
+        *,
+        schema_version: int | None = None,
+    ) -> dict[str, Any]:
+        layout = self.layout(source_table, schema_version)
+        return convert_key(layout, source_key, self.schema, where)
 
     def _make_row(self, table_name: str, data: dict[str, Any]) -> Row:
         table = self.schema.tables[table_name]
@@ -214,26 +232,24 @@ class Restorer:
         )
 
     def _full_target_row(
-        self, source_table: str, source_row: dict[str, Any], where: str
-    ) -> dict[str, Any]:
-        """Convert a complete source row image into a complete target row."""
-        binding = self.bindings.tables[source_table]
-        table = self.schema.tables[binding.target_table]
-        missing = set(binding.columns) - set(source_row)
-        if missing:
-            raise CaptureRestoreError(
-                f"{where}: incomplete source image, missing columns {sorted(missing)}"
-            )
-        target = self._convert_partial(source_table, source_row, where)
-        # Complete image: every target column must be present (nullable may be null).
-        absent = set(table.columns) - set(target)
-        for col_name in absent:
-            if not table.columns[col_name].nullable:
-                raise CaptureRestoreError(
-                    f"{where}: missing NOT NULL column {table.name}.{col_name!r}"
-                )
-            target[col_name] = None
-        return target
+        self,
+        source_table: str,
+        source_row: dict[str, Any],
+        where: str,
+        *,
+        schema_version: int | None = None,
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Convert a complete source row image into a complete target row.
+
+        Fields introduced by a later schema version are filled from their
+        declared constant backfill; the returned tuple names those target
+        columns so the provenance map can record them.
+        """
+        layout = self.layout(source_table, schema_version)
+        target = convert_image(
+            layout, source_row, self.schema, where, complete=True
+        )
+        return target, tuple(a.target_column for a in layout.added)
 
     # ------------------------------------------------------------- applying
     def apply_transaction(
@@ -247,7 +263,19 @@ class Restorer:
         overlay: dict[tuple[str, str], Row | None] = {}
         outputs: list[OutputEvent] = []
         for event in events:
-            self._apply_event(tx_id, event, overlay, outputs)
+            try:
+                self._apply_event(tx_id, event, overlay, outputs)
+            except CaptureRestoreError as exc:
+                exc.with_locator(
+                    tx_id=tx_id, tx_order=event.tx_order,
+                    table=event.table, source_op=event.op,
+                    schema_version=event.schema_version,
+                    coordinates=[
+                        {"stream": c.stream, "offset": c.offset}
+                        for c in event.coordinates
+                    ],
+                )
+                raise
         merged = self.store.merged(overlay)
         self._check_commit(tx_id, merged, overlay)
         self.store = merged
@@ -260,14 +288,19 @@ class Restorer:
         overlay: dict[tuple[str, str], Row | None],
         outputs: list[OutputEvent],
     ) -> None:
-        where = f"tx {tx_id!r} tx_order {event.tx_order}"
+        where = event.where() if event.tx_id == tx_id else (
+            f"tx {tx_id!r} tx_order {event.tx_order}"
+        )
         source_table = event.table
         if source_table not in self.bindings.tables:
             raise CaptureRestoreError(
                 f"{where}: source table {source_table!r} has no binding"
             )
+        schema_version = event.schema_version
         table = self._target_table(source_table)
-        target_key = self._convert_key(source_table, event.key, where)
+        target_key = self._convert_key(
+            source_table, event.key, where, schema_version=schema_version
+        )
         token = encode_key_values(
             [target_key[c] for c in table.primary_key],
             table.column_types(table.primary_key),
@@ -279,6 +312,7 @@ class Restorer:
             source_table=source_table,
             op=event.op,
             coordinates=event.coordinates,
+            schema_version=schema_version,
         )
 
         if event.op == "insert":
@@ -287,7 +321,9 @@ class Restorer:
                     f"{where}: insert requires an absent key "
                     f"{table.name}{target_key!r}, but a row exists"
                 )
-            target_after = self._full_target_row(source_table, event.after, where)
+            target_after, backfilled = self._full_target_row(
+                source_table, event.after, where, schema_version=schema_version
+            )
             insert_key_token = encode_key_values(
                 [target_after[c] for c in table.primary_key],
                 table.column_types(table.primary_key),
@@ -301,7 +337,8 @@ class Restorer:
             outputs.append(
                 OutputEvent(
                     op="insert", table=table.name, key=target_key,
-                    before=None, after=target_after, source=source,
+                    before=None, after=target_after,
+                    source=_with_backfill(source, backfilled),
                 )
             )
             return
@@ -314,7 +351,8 @@ class Restorer:
 
         if event.op == "delete":
             before_partial = self._convert_partial(
-                source_table, event.before, f"{where} before"
+                source_table, event.before, f"{where} before",
+                schema_version=schema_version,
             )
             # Partial before assertions: every named column must match.
             for col_name, value in before_partial.items():
@@ -339,7 +377,8 @@ class Restorer:
         # update -----------------------------------------------------------
         assert event.op == "update"
         before_partial = self._convert_partial(
-            source_table, event.before, f"{where} before"
+            source_table, event.before, f"{where} before",
+            schema_version=schema_version,
         )
         for col_name, value in before_partial.items():
             if not _scalar_equal(
@@ -350,7 +389,8 @@ class Restorer:
                     f"value {cur.data[col_name]!r} does not match asserted {value!r}"
                 )
         after_partial = self._convert_partial(
-            source_table, event.after, f"{where} after"
+            source_table, event.after, f"{where} after",
+            schema_version=schema_version,
         )
 
         if event.new_key is None:
@@ -380,7 +420,9 @@ class Restorer:
             return
 
         # Key move: explicit new_key expands into adjacent delete + insert.
-        new_target_key = self._convert_key(source_table, event.new_key, where)
+        new_target_key = self._convert_key(
+            source_table, event.new_key, where, schema_version=schema_version
+        )
         # after key values, when present, must agree with new_key.
         for pk_col in table.primary_key:
             if pk_col in after_partial:
@@ -433,6 +475,7 @@ class Restorer:
             op=event.op,
             coordinates=event.coordinates,
             expanded_from_key_move=True,
+            schema_version=schema_version,
         )
         outputs.append(
             OutputEvent(
@@ -546,6 +589,21 @@ class Restorer:
                     if token is not None:
                         index[(table_name, tuple(key))].add(token)
         return index
+
+
+def _with_backfill(source: EventSource, backfilled: tuple[str, ...]) -> EventSource:
+    if not backfilled:
+        return source
+    return EventSource(
+        tx_id=source.tx_id,
+        tx_order=source.tx_order,
+        source_table=source.source_table,
+        op=source.op,
+        coordinates=source.coordinates,
+        expanded_from_key_move=source.expanded_from_key_move,
+        schema_version=source.schema_version,
+        backfilled=backfilled,
+    )
 
 
 def _unique_token(

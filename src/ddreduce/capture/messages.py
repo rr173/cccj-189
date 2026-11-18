@@ -30,6 +30,11 @@ All kinds:
                           forbidden on delete
     new_key     optional   only on update; object with the full source key
 
+``change`` in a **capture-v2** (schema-evolving) archive additionally carries
+``schema_version`` - the schema version the writer used for this row image.
+It is mandatory there and forbidden in capture-v1.  Its value must be one of
+the versions declared by the archive's schema history.
+
 ``commit`` adds:
 
     field        required  type / rule
@@ -242,7 +247,27 @@ def validate_message(
         allowed = set(ENVELOPE_FIELDS) | {
             "tx_id", "tx_order", "table", "op", "key", "before", "after", "new_key"
         }
+        if manifest.evolving:
+            allowed.add("schema_version")
         _reject_unknown(obj, allowed, where)
+        if manifest.evolving:
+            if "schema_version" not in obj:
+                raise CaptureArchiveError(
+                    f"{where}: change message missing schema_version; "
+                    "capture-v2 archives must declare the write schema version "
+                    "of every row image"
+                )
+            sv = obj["schema_version"]
+            if not _is_pos_int(sv):
+                raise CaptureArchiveError(
+                    f"{where}: schema_version must be an integer >= 1 "
+                    "(booleans rejected)"
+                )
+        elif "schema_version" in obj:
+            raise CaptureArchiveError(
+                f"{where}: schema_version is only allowed in capture-v2 "
+                "archives with a schema history"
+            )
         for field_name in ("tx_id", "tx_order", "table", "op", "key"):
             if field_name not in obj:
                 raise CaptureArchiveError(f"{where}: change missing field {field_name!r}")
@@ -259,7 +284,26 @@ def validate_message(
             raise CaptureArchiveError(
                 f"{where}: op must be one of {list(CHANGE_OPS)}, got {op!r}"
             )
-        pk = _source_pk(manifest, source_table, schema)
+        if manifest.evolving:
+            from .evolve import layout_for
+
+            if manifest.history is None:  # pragma: no cover - manifest always sets it
+                raise CaptureArchiveError(
+                    f"{where}: archive declares a schema history but none is loaded"
+                )
+            _check_declared_version(manifest, obj["schema_version"], where)
+            from .errors import CaptureRestoreError
+
+            try:
+                layout = layout_for(
+                    manifest.history, manifest, schema, source_table,
+                    obj["schema_version"],
+                )
+            except CaptureRestoreError as exc:
+                raise CaptureArchiveError(f"{where}: {exc}") from exc
+            pk = layout.source_pk
+        else:
+            pk = _source_pk(manifest, source_table, schema)
         key = _check_key(obj, "key", pk, where)
 
         has_before = "before" in obj
@@ -290,8 +334,18 @@ def validate_message(
                 image = obj[image_field]
                 if not isinstance(image, dict):
                     raise CaptureArchiveError(f"{where}: {image_field} must be an object")
+        if manifest.evolving:
+            _check_images_named_by_version(
+                obj, layout.source_columns, obj["schema_version"], where
+            )
         if op == "insert":
-            _check_complete_after(obj["after"], manifest, source_table, where)
+            if manifest.evolving:
+                _check_complete_after_versioned(
+                    obj["after"], obj["schema_version"], manifest, schema,
+                    source_table, where,
+                )
+            else:
+                _check_complete_after(obj["after"], manifest, source_table, where)
         if "new_key" in obj:
             if op != "update":
                 raise CaptureArchiveError(f"{where}: new_key is only allowed on update")
@@ -323,6 +377,71 @@ def validate_message(
     elif "commit_seq" in obj:
         raise CaptureArchiveError(f"{where}: abort must not carry commit_seq")
     return obj
+
+
+def _check_images_named_by_version(
+    obj: dict, source_columns, schema_version: int, where: str
+) -> None:
+    """Every column named in an image must exist in the declared version.
+
+    A message that references a column its version never had (for example an
+    event written before a rename that names the *new* column) means the
+    archive and its schema history disagree; the archive is rejected instead
+    of silently treating the column as missing.
+    """
+    known = set(source_columns)
+    for image_field in ("before", "after"):
+        if image_field not in obj:
+            continue
+        unknown = set(obj[image_field]) - known
+        if unknown:
+            raise CaptureArchiveError(
+                f"{where}: {image_field} names columns {sorted(unknown)} that "
+                f"schema version {schema_version} does not define "
+                f"(known: {sorted(known)})"
+            )
+
+
+def _check_declared_version(
+    manifest: Manifest, schema_version: int, where: str
+) -> None:
+    """The declared version must exist in this archive's ordered history."""
+    numbers = manifest.history.version_numbers() if manifest.history else []
+    if schema_version not in numbers:
+        raise CaptureArchiveError(
+            f"{where}: schema_version {schema_version} is not declared by the "
+            f"archive's schema history (known versions: {numbers})"
+        )
+
+
+def _check_complete_after_versioned(
+    after: dict, schema_version: int, manifest: Manifest, schema: "Schema",
+    source_table: str, where: str,
+) -> None:
+    """capture-v2 insert images are complete *in their declared version*.
+
+    Columns added by a later schema version are not expected here: they are
+    supplied from the declared backfill during conversion.
+    """
+    from .evolve import layout_for
+
+    from .errors import CaptureRestoreError
+
+    try:
+        layout = layout_for(
+            manifest.history, manifest, schema, source_table, schema_version
+        )
+    except CaptureRestoreError as exc:
+        raise CaptureArchiveError(f"{where}: {exc}") from exc
+    unknown = set(after) - set(layout.source_columns)
+    if unknown:
+        raise CaptureArchiveError(f"{where}: after has unknown columns {sorted(unknown)}")
+    missing = set(layout.source_columns) - set(after)
+    if missing:
+        raise CaptureArchiveError(
+            f"{where}: insert after must be complete for schema version "
+            f"{schema_version}; missing columns {sorted(missing)}"
+        )
 
 
 def _check_complete_after(

@@ -1,0 +1,68 @@
+{
+  "format": "capture-schema-history-v1",
+  "versions": [
+    {
+      "effective_commit_seq": 0,
+      "tables": {
+        "accounts": {
+          "columns": [
+            {
+              "field_id": "f-key",
+              "name": "key",
+              "nullable": false,
+              "type": "string"
+            },
+            {
+              "field_id": "f-amount",
+              "name": "gross",
+              "nullable": false,
+              "type": "int"
+            }
+          ],
+          "foreign_keys": [],
+          "primary_key": [
+            "f-key"
+          ],
+          "target_table": "accounts",
+          "unique_keys": []
+        }
+      },
+      "version": 1
+    },
+    {
+      "effective_commit_seq": 2,
+      "tables": {
+        "accounts": {
+          "columns": [
+            {
+              "field_id": "f-key",
+              "name": "key",
+              "nullable": false,
+              "type": "string"
+            },
+            {
+              "field_id": "f-amount",
+              "name": "amount",
+              "nullable": false,
+              "type": "float"
+            },
+            {
+              "backfill": "USD",
+              "field_id": "f-currency",
+              "name": "currency",
+              "nullable": false,
+              "type": "string"
+            }
+          ],
+          "foreign_keys": [],
+          "primary_key": [
+            "f-key"
+          ],
+          "target_table": "accounts",
+          "unique_keys": []
+        }
+      },
+      "version": 2
+    }
+  ]
+}

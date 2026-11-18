@@ -382,7 +382,7 @@ runtime artifact and is not committed.
 
 ---
 
-## 6. Offline capture-v1 ingestion (`capture-import` / `capture-verify`)
+## 6. Offline capture ingestion (`capture-import` / `capture-verify`)
 
 Operations sometimes receives a **partitioned capture archive** rather than a
 ready-made full-image log: one transaction's row changes are scattered across
@@ -395,6 +395,14 @@ The two offline commands below restore such an archive into the existing
 full-image input package without adding any reduction strategy and without
 touching the existing searchers. **Neither command ever runs an oracle**; the
 result is handed to the normal `log-replay` / `log-reduce` afterwards.
+
+Two archive formats are accepted:
+
+* **capture-v1** - one fixed schema plus table/column bindings (the existing
+  format; its inputs, commands and package format are unchanged);
+* **capture-v2** - an *ordered schema history* with stable field IDs, for
+  archives that contain events written before and after an upstream rename or
+  column addition.
 
 ### The capture-v1 format
 
@@ -421,7 +429,8 @@ undeclared files):
 }
 ```
 
-* `version` must be `1`; any other value is refused.
+* `version` must be `1`; any other value is refused (version `2` selects the
+  schema-history format described below).
 * `snapshot_commit_seq` is the last commit point already contained in the
   starting snapshot; `sealed_commit_seq` is the high-water mark the archive
   promises to have sealed.  Gaps between commit sequence numbers are allowed.
@@ -518,8 +527,8 @@ success; failures and interruptions remove all staging and spill state.  The
 package contains exactly:
 
 ```
-<out>/snapshot/<table>.jsonl   verbatim starting snapshot
-<out>/schema.json              the target schema
+<out>/snapshot/<table>.jsonl   starting snapshot in the target schema
+<out>/schema.json              the unified target schema
 <out>/changes.jsonl            full-image committed transactions (old log format)
 <out>/capture-map.jsonl        every output tx/event -> source logical event
                                and ALL transport coordinates
@@ -528,43 +537,183 @@ package contains exactly:
 
 The map traces each output event (including both halves of a key-move
 expansion) back to its source `(tx_id, tx_order)` and every coordinate it was
-seen at.  `tx_id` values are preserved verbatim.
+seen at.  `tx_id` values are preserved verbatim.  For capture-v2 the map also
+records each event's declared `schema_version` and any `backfilled_columns`.
+
+### capture-v2: ordered schema history
+
+An upstream table can be renamed and extended while one archive still holds
+records written on both sides of the change.  Reading old records with the
+newest schema silently turns old columns into missing values; reading new
+records with the old schema silently drops the new information.  A
+capture-v2 archive therefore declares its schema history explicitly:
+
+```json
+{
+  "version": 2,
+  "source_id": "src-evolving-1",
+  "snapshot_commit_seq": 0,
+  "sealed_commit_seq": 2,
+  "streams": [{"name": "s1", "first_offset": 0, "last_offset": 3}],
+  "files": ["shards/s1-00.jsonl", "shards/s1-01.jsonl"],
+  "schema_history": "schema-history.json",
+  "history_hash": "c8cd37a0…8c89"
+}
+```
+
+`schema-history.json` (`format: "capture-schema-history-v1"`) holds an
+**ordered, non-empty** list of versions:
+
+```json
+{
+  "format": "capture-schema-history-v1",
+  "versions": [
+    {"version": 1, "effective_commit_seq": 0, "tables": {
+      "accounts": {"target_table": "accounts", "primary_key": ["f-key"],
+        "columns": [
+          {"field_id": "f-key",    "name": "key",   "type": "string", "nullable": false},
+          {"field_id": "f-amount", "name": "gross", "type": "int",    "nullable": false}],
+        "unique_keys": [], "foreign_keys": []}}},
+    {"version": 2, "effective_commit_seq": 2, "tables": {
+      "accounts": {"target_table": "accounts", "primary_key": ["f-key"],
+        "columns": [
+          {"field_id": "f-key",      "name": "key",      "type": "string", "nullable": false},
+          {"field_id": "f-amount",   "name": "amount",   "type": "float",  "nullable": false},
+          {"field_id": "f-currency", "name": "currency", "type": "string", "nullable": false,
+           "backfill": "USD"}],
+        "unique_keys": [], "foreign_keys": []}}}
+  ]
+}
+```
+
+Each version binds a **strictly increasing** version number, the commit point
+at which it becomes the write schema, and the table/column definitions
+including a **stable field ID** per column.  Constraints name field IDs too.
+`version` numbers must be unique, `effective_commit_seq` must strictly
+increase, version 1 must be effective at commit `0`, and every later switch
+point must lie within the sealed range.
+
+Every `change` message in a capture-v2 archive carries an extra
+`schema_version` naming the version its row image was written with (and a
+capture-v1 message may not carry one).  Import validates, before touching any
+row state:
+
+* the version is declared by this archive's history;
+* every column named in `before`/`after` exists **in that version** - a
+  message naming a column of another version is rejected with its
+  source coordinate;
+* the transaction's events all declare one version, and that version is the
+  one in force at the transaction's `commit_seq`.  A schema switch happens at
+  a **transaction commit boundary**: no transaction is ever split across two
+  versions, and a version is never applied early to events that merely
+  arrived first in transport order.
+
+The manifest's `history_hash` binds the exact history content (SHA-256 over
+canonical JSON).  `capture-import`/`capture-verify` take the same history with
+`--schema-history` and refuse a history whose hash differs - an archive is
+never reinterpreted against a different history.
+
+#### Supported evolution
+
+Stable field IDs carry the identity of a business field; the *name* is just
+the current label.  Between consecutive versions only these changes are
+allowed:
+
+| change | allowed |
+| --- | --- |
+| rename a column (same field ID, new name) | yes |
+| add a column with an explicit constant `backfill` | yes (also for NOT NULL) |
+| add a nullable column without a backfill | yes (older rows get `null`) |
+| `int` -> `float` | yes (lossless widening) |
+| delete a column | **no** |
+| replace a field ID (same name, different ID is a different field) | **no** |
+| narrow a type, or retype anything but `int` -> `float` | **no** |
+| change an existing column's nullable rule | **no** |
+| add a new NOT NULL column without a backfill | **no** |
+| change primary key, unique keys or foreign keys | **no** |
+
+Names are not identities: two different field IDs are never merged because
+their names coincide, and a rename never creates a second target column.
+
+#### Conversion to the unified target schema
+
+Each message is interpreted first with its declared version (types validated
+as that version declared them, primary key as that version defined it), then
+mapped onto the final target schema by field ID:
+
+* a renamed field writes the same target column in both versions;
+* a target column whose field did not exist yet is written from that field's
+  constant backfill (for complete images: snapshot rows and insert after
+  images); partial images still mean *preserve*, never *backfill*;
+* `int` values widen to `float` exactly (no value changes);
+* missing and explicit null stay distinct throughout.
+
+The starting snapshot is the **initial** version's data, written under that
+version's historical column names; it is converted the same way (renamed
+columns moved, later columns backfilled) and then validated with the normal
+target-schema unique/FK rules.
+
+The report's `schema_history` section records the history hash, every version
+and its switch point; `target_schema` records the unified target schema
+content hash.  Both are compared by the verifier.
 
 ### Independent verification
 
-`capture-verify` takes the original archive, snapshot, schema, window and a
-package, and re-runs the whole scan, de-duplication, assembly and restoration
-itself.  It then compares the complete transaction images, window boundary,
-provenance map and report bindings/counts against the package.  It never
-reads an "import succeeded" flag and never compares only final table state -
-so a dropped-but-overwritten update, a folded delete/rebuild, rewritten
-transport coordinates or doctored counts are all caught.  Verdicts are
-deliberately not oracle-style PASS/FAIL:
+`capture-verify` takes the original archive, snapshot, schema (and for
+capture-v2 the schema history) plus a package, and re-runs the whole scan,
+de-duplication, assembly, per-version interpretation, commit-boundary check
+and restoration itself.  It then compares the complete transaction images,
+window boundary, provenance map, converted snapshot and report
+bindings/counts/hashes against the package.  It never reads an "import
+succeeded" flag and never compares only final table state.
+
+Verdicts are deliberately not oracle-style PASS/FAIL:
 
 * `CAPTURE_PACKAGE_MATCH` - the independent restoration equals the package;
-* `ARCHIVE_INVALID` - the source archive itself is incomplete or conflicting;
+* `ARCHIVE_INVALID` - the source archive or its schema history is incomplete,
+  conflicting or violates the supported evolution rules;
 * `RESTORE_FAILED` - a valid archive cannot be restored against the given
   snapshot/schema (stale before-image, key collision, commit constraint, ...);
 * `PACKAGE_MISMATCH` - restoration succeeds but the package differs.
 
-Failures name the source stream/offset, transaction and logical order.
+The schema-history checks specifically catch:
+
+* the pre-rename column mapped onto a target column that merely *shares its
+  name* but belongs to a different field ID;
+* a backfilled value replaced by `null` (or any other value);
+* events converted with the wrong version relative to the commit switch
+  (including a doctored `schema_version` in the provenance map);
+* a modified schema-history hash or switch point in the report;
+* a package snapshot that lost a backfill or kept a historical column name.
+
+Failures name the source stream/offset, transaction, logical order, schema
+version and commit sequence.  The failure classes stay distinct in the
+report.
 
 ### Commands
 
 ```bash
-# Restore an archive into a full-image package (no oracle is started).
+# capture-v1: restore an archive into a full-image package (no oracle).
 PYTHONPATH=src python3 -P -m ddreduce.cli capture-import \
   --archive demo/capture/sample/archive \
   --snapshot demo/capture/sample/snapshot \
   --schema demo/capture/sample/schema.json \
   --through 14 --out /tmp/capture-package
 
-# Independently re-restore and compare the package.
+# independently re-restore and compare the package.
 PYTHONPATH=src python3 -P -m ddreduce.cli capture-verify \
   --archive demo/capture/sample/archive \
   --snapshot demo/capture/sample/snapshot \
   --schema demo/capture/sample/schema.json \
   --through 14 --package /tmp/capture-package
+
+# capture-v2: the same commands plus --schema-history.
+PYTHONPATH=src python3 -P -m ddreduce.cli capture-import \
+  --archive demo/capture/evolving-sample/archive \
+  --snapshot demo/capture/evolving-sample/snapshot \
+  --schema demo/capture/evolving-sample/schema.json \
+  --schema-history demo/capture/evolving-sample/archive/schema-history.json \
+  --through 2 --out /tmp/evolving-package
 
 # The result then feeds the unchanged existing tools.
 PYTHONPATH=src python3 -P -m ddreduce.cli log-replay \
@@ -574,35 +723,52 @@ PYTHONPATH=src python3 -P -m ddreduce.cli log-replay \
 ```
 
 `capture-import`/`capture-verify` exit `0` on match/success and `2` on any
-archive, restore or package failure.
+archive, history, restore or package failure.
 
-### Bounded sample and reproducible generator
+### Bounded samples and reproducible generators
 
-`demo/capture/sample/` is a small, committed cross-partition archive built by
-`demo/capture/gen_capture.py`.  Its hand-computed scenario: snapshot key `k`
-has `amount=10, note="old"`; transaction A (commit point 13) first sets
-`amount=20` then explicitly sets `note` to null; transaction B (commit point
-14) moves key `k` to `z`; an aborted transaction that would set
+`demo/capture/sample/` is a small, committed cross-partition capture-v1
+archive built by `demo/capture/gen_capture.py`.  Its hand-computed scenario:
+snapshot key `k` has `amount=10, note="old"`; transaction A (commit point 13)
+first sets `amount=20` then explicitly sets `note` to null; transaction B
+(commit point 14) moves key `k` to `z`; an aborted transaction that would set
 `amount=999` is present but never applied.  A's messages are retransmitted
 (physically and logically), the shards are shuffled and B's commit arrives
 before B's change.  The correct restoration is one line for A with two
-full-image updates and one line for B as adjacent delete/insert, with B's
-complete before image equal to `amount=20, note=null`.
+full-image updates and one line for B as adjacent delete/insert.
+
+`demo/capture/evolving-sample/` is the committed capture-v2 hand sample built
+by `demo/capture/gen_evolving.py --flavor hand`:
+
+* version 1 has field `f-amount` named `gross`, typed `int`;
+* version 2 (effective at commit 2) renames it to `amount`, widens it to
+  `float`, and adds `currency` with the constant backfill `"USD"`;
+* commit 1 (version 1) updates the row; commit 2 (version 2) updates it again.
+
+After import both events write the target column `amount` (10.0 -> 20.0 ->
+30.0), the old row and the updated row both carry `currency="USD"`, and the
+independent verifier matches.  `--flavor nameclash` builds an archive where a
+new field reuses an old column *name*: the legacy field keeps its own target
+column and the new field is backfilled, proving names alone never merge
+fields.
 
 ```bash
-# Bounded hand sample (also emits --flavor direct|overwrite, two archives
-# with the same final row but different histories).
-python3 -I demo/capture/gen_capture.py --out /tmp/sample --flavor hand --seed 7 --shards 3
+# Bounded samples (byte-identical for fixed arguments).
+python3 -I demo/capture/gen_capture.py  --out /tmp/sample  --flavor hand --seed 7 --shards 3
+python3 -I demo/capture/gen_evolving.py --out /tmp/evolving --flavor hand --seed 7 --shards 2
+python3 -I demo/capture/gen_evolving.py --out /tmp/clash   --flavor nameclash --seed 3 --shards 1
 # Larger archives are generated at runtime for the resource tests only.
-python3 -I demo/capture/gen_capture.py --out /tmp/big --flavor large --tx 2000 --keys 200
+python3 -I demo/capture/gen_capture.py  --out /tmp/big --flavor large --tx 2000 --keys 200
+python3 -I demo/capture/gen_evolving.py --out /tmp/ebig --flavor large --tx 600 --keys 60
 ```
 
 The scan/de-duplication/assembly stage spills to a temporary SQLite database
 (messages, transaction grouping and per-event provenance are never held in
 memory as the archive grows); only the snapshot and current row state stay in
 memory, and output provenance is streamed one record at a time.  Spill files
-are removed on both success and failure; the large-scale test measures peak
-heap and spill bytes against archive growth and checks the cleanup.
+are removed on both success and failure; the large-scale tests measure peak
+heap and spill bytes against archive growth (capture-v1 and capture-v2) and
+check the cleanup.
 
 ---
 
@@ -672,7 +838,30 @@ aggregation command. It covers:
   extra package files, with the three failure classes kept distinct;
 - source-to-target table/column renaming bindings and post-rename type rules;
 - a runtime-generated large archive checking bounded heap growth, linear spill
-  growth and spill/staging cleanup on both success and failure.
+  growth and spill/staging cleanup on both success and failure;
+- **capture-v2 schema evolution**: ordered histories with stable field IDs and
+  explicit backfills; refusal of duplicate version numbers, non-increasing
+  commit points, out-of-range switch points and a history that differs from
+  the one sealed in the manifest;
+- the exact hand-computed evolving sample (int `gross` -> float `amount`
+  rename, `currency="USD"` backfill, one commit on each side of the switch):
+  both events reach the target column, old and new rows keep the backfill,
+  and independent verification matches;
+- same-name/different-field-ID archives proving fields are never merged by
+  name, plus verifier detection of a renamed column poured into a same-named
+  target column, a backfill replaced by null, events converted with the wrong
+  version, and a doctored schema-history hash or switch point in the report;
+- supported-evolution refusals: deleted columns, replaced field IDs, narrowed
+  types, changed nullability, new NOT NULL columns without a backfill and
+  changed key/constraint definitions, plus message/history disagreements
+  (missing or unknown `schema_version`, images naming another version's
+  columns, transactions straddling a switch);
+- a naive independent capture-v2 reference converter cross-checking
+  enumerated version/commit/window combinations and three-version histories;
+- the real incremental demo re-encoded as a two-version archive, converted,
+  replayed through `log-replay` and driving the demo to its FAIL signature;
+- a runtime-generated three-version archive checking bounded heap, linear
+  spill growth and cleanup on success and failure.
 
 Run the suite:
 
@@ -700,10 +889,12 @@ src/ddreduce/
   replay.py    version/absence witnesses, normalized replay, log candidates
   logengine.py batch ddmin over transaction deletions + per-transaction pass
   logverify.py independent CDC certificate verification
-  capture/     offline capture-v1 archive ingestion (no oracle, no new reducer)
+  capture/     offline capture ingestion (no oracle, no new reducer)
     manifest.py   capture.json parsing, path safety, binding bijections
     messages.py   envelope/kind field tables and structural message validation
     store.py      streaming SQLite-backed scan, de-duplication and assembly
+    history.py    capture-v2 ordered schema history, field IDs, evolution rules
+    evolve.py     per-version interpretation, field-ID mapping, backfill, widening
     restore.py    partial-image row restoration, key moves, commit constraints
     importer.py   capture-import: windowed restore into a full-image package
     verifier.py   capture-verify: independent re-restore and package comparison
@@ -712,7 +903,7 @@ src/ddreduce/
 demo/
   transform/   real multi-table ETL command, schema, data, oracle config
   incremental/ real CDC incremental aggregation command, data, log generator
-  capture/     capture-v1 hand sample plus the reproducible archive generator
+  capture/     capture-v1 + capture-v2 hand samples and their generators
 fixtures/      small committed hand-computed fixture
 tests/         mock oracle, naive replayers, and the full scenario suite
 ```

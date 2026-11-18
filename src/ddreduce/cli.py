@@ -35,6 +35,7 @@ from .values import DataError, SchemaError
 from .verify import Verifier, write_report
 from .capture import (
     CaptureError,
+    CaptureSchemaHistoryError,
     run_import,
     run_verify,
 )
@@ -414,7 +415,7 @@ def cmd_log_verify(args: argparse.Namespace) -> int:
 
 # ============================================================== capture mode
 def cmd_capture_import(args: argparse.Namespace) -> int:
-    """Restore a capture-v1 archive into a full-image log package (no oracle)."""
+    """Restore a capture archive into a full-image log package (no oracle)."""
     try:
         result = run_import(
             archive=args.archive,
@@ -423,6 +424,7 @@ def cmd_capture_import(args: argparse.Namespace) -> int:
             output_dir=args.out,
             through=args.through,
             tmp_root=args.tmpdir,
+            history_path=args.schema_history,
         )
     except CaptureError as exc:
         print(f"CAPTURE IMPORT FAILED: {exc}", file=sys.stderr)
@@ -439,6 +441,12 @@ def cmd_capture_import(args: argparse.Namespace) -> int:
             peak=result.peak_spill_bytes, **counts,
         )
     )
+    history = result.report.get("schema_history")
+    if history is not None:
+        print(
+            f"schema history: {len(history['versions'])} version(s), "
+            f"hash {history['history_hash']}"
+        )
     if args.report:
         Path(args.report).write_text(
             json.dumps(result.report, ensure_ascii=False, sort_keys=True, indent=2)
@@ -459,6 +467,7 @@ def cmd_capture_verify(args: argparse.Namespace) -> int:
             through=args.through,
             package_dir=args.package,
             tmp_root=args.tmpdir,
+            history_path=args.schema_history,
         )
     except CaptureError as exc:
         print(f"CAPTURE VERIFY FAILED: {exc}", file=sys.stderr)
@@ -557,7 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ------------------------------------------------------------- capture v1
     capture_common = argparse.ArgumentParser(add_help=False)
     capture_common.add_argument(
-        "--archive", required=True, help="capture-v1 archive directory (with capture.json)"
+        "--archive", required=True,
+        help="capture archive directory (with capture.json; v1 or v2)",
     )
     capture_common.add_argument(
         "--snapshot", required=True, help="starting snapshot directory of JSONL tables"
@@ -571,11 +581,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--tmpdir", default=None,
         help="directory for spill working files (defaults to the system temp dir)",
     )
+    capture_common.add_argument(
+        "--schema-history", dest="schema_history", default=None,
+        help="ordered schema-history JSON for a capture-v2 archive "
+             "(must be the exact history the archive was sealed with)",
+    )
 
     p_capture_import = sub.add_parser(
         "capture-import",
         parents=[capture_common],
-        help="restore a capture-v1 archive into a full-image changes package",
+        help="restore a capture archive into a full-image changes package",
     )
     p_capture_import.add_argument(
         "--out", required=True,

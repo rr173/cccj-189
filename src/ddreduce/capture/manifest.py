@@ -35,13 +35,16 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from ..schema import Schema
 from ..values import canonical_json
-from .errors import CaptureArchiveError
+from .errors import CaptureArchiveError, CaptureSchemaHistoryError
 
 FORMAT_VERSION = 1
+SCHEMA_EVOLVING_FORMAT_VERSION = 2
 MANIFEST_NAME = "capture.json"
+HISTORY_NAME = "schema-history.json"
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,8 @@ class Manifest:
     files: tuple[str, ...]
     bindings: Bindings
     raw: dict
+    archive_dir: str = ""
+    history: Any = None  # SchemaHistory for capture-v2, None for capture-v1
 
     def stream(self, name: str) -> StreamSpec | None:
         for spec in self.streams:
@@ -97,6 +102,17 @@ class Manifest:
     def canonical_bytes(self) -> bytes:
         """Deterministic serialization of the manifest content (for hashing)."""
         return canonical_json(self.raw).encode("utf-8")
+
+    @property
+    def evolving(self) -> bool:
+        """True for capture-v2 archives carrying an ordered schema history."""
+        return self.version == SCHEMA_EVOLVING_FORMAT_VERSION
+
+    def history_path(self) -> Path | None:
+        """Path of the declared history file (capture-v2 only)."""
+        if not self.evolving or not self.archive_dir:
+            return None
+        return Path(self.archive_dir) / HISTORY_NAME
 
 
 def _is_nonneg_int(value: object) -> bool:
@@ -132,6 +148,10 @@ def safe_relative_path(rel: object) -> str:
     # the manifest itself must not point at the manifest file.
     if normalized == MANIFEST_NAME:
         raise CaptureArchiveError(f"{where}: manifest itself is not a shard file: {rel!r}")
+    if normalized == HISTORY_NAME:
+        raise CaptureArchiveError(
+            f"{where}: schema history is not a shard file: {rel!r}"
+        )
     return normalized.replace(os.sep, "/")
 
 
@@ -150,6 +170,16 @@ def load_manifest(archive_dir: str | Path, schema: Schema) -> Manifest:
         raise CaptureArchiveError(f"{MANIFEST_NAME}: manifest must be a JSON object")
 
     where = MANIFEST_NAME
+    if "version" not in raw:
+        raise CaptureArchiveError(f"{where}: missing fields ['version']")
+    if raw["version"] not in (FORMAT_VERSION, SCHEMA_EVOLVING_FORMAT_VERSION):
+        raise CaptureArchiveError(
+            f"{where}: unsupported capture version {raw['version']!r}; "
+            f"supported versions are {FORMAT_VERSION} (single schema) and "
+            f"{SCHEMA_EVOLVING_FORMAT_VERSION} (ordered schema history)"
+        )
+    if raw["version"] == SCHEMA_EVOLVING_FORMAT_VERSION:
+        return _load_evolving_manifest(archive, raw, schema, where)
     _require_fields(
         raw,
         ("version", "source_id", "snapshot_commit_seq", "sealed_commit_seq",
@@ -162,12 +192,6 @@ def load_manifest(archive_dir: str | Path, schema: Schema) -> Manifest:
     }
     if unknown:
         raise CaptureArchiveError(f"{where}: unknown manifest fields {sorted(unknown)}")
-
-    if raw["version"] != FORMAT_VERSION:
-        raise CaptureArchiveError(
-            f"{where}: unsupported capture version {raw['version']!r}; "
-            f"only version {FORMAT_VERSION} is supported"
-        )
     source_id = raw["source_id"]
     if not isinstance(source_id, str) or not source_id:
         raise CaptureArchiveError(f"{where}: source_id must be a non-empty string")
@@ -185,7 +209,7 @@ def load_manifest(archive_dir: str | Path, schema: Schema) -> Manifest:
         )
 
     streams = _parse_streams(raw["streams"], where)
-    files = _parse_files(archive, raw["files"], where)
+    files = _parse_files(archive, raw["files"], where, allow=(MANIFEST_NAME,))
     bindings = _parse_bindings(raw["bindings"], schema, where)
     return Manifest(
         version=FORMAT_VERSION,
@@ -196,7 +220,126 @@ def load_manifest(archive_dir: str | Path, schema: Schema) -> Manifest:
         files=files,
         bindings=bindings,
         raw=raw,
+        archive_dir=str(archive),
     )
+
+
+def _load_evolving_manifest(
+    archive: Path, raw: dict, schema: Schema, where: str
+) -> "Manifest":
+    """capture-v2: same transport envelope plus a declared schema history.
+
+    ``bindings`` is replaced by ``schema_history`` (the history file carries
+    every version's table/column/field-ID binding).  ``history_hash`` pins the
+    exact history content so an archive can never be read against a different
+    history than the one it was sealed with.
+    """
+    expected = {
+        "version", "source_id", "snapshot_commit_seq", "sealed_commit_seq",
+        "streams", "files", "schema_history", "history_hash",
+    }
+    unknown = set(raw) - expected
+    missing = expected - set(raw)
+    if unknown or missing:
+        raise CaptureArchiveError(
+            f"{where}: unsupported capture version {SCHEMA_EVOLVING_FORMAT_VERSION} "
+            "manifest shape - capture version 2 requires an ordered schema "
+            f"history and drops the single-schema bindings; missing fields "
+            f"{sorted(missing)}, unknown manifest fields {sorted(unknown)}"
+        )
+    source_id = raw["source_id"]
+    if not isinstance(source_id, str) or not source_id:
+        raise CaptureArchiveError(f"{where}: source_id must be a non-empty string")
+    for field_name in ("snapshot_commit_seq", "sealed_commit_seq"):
+        if not _is_nonneg_int(raw[field_name]):
+            raise CaptureArchiveError(
+                f"{where}: {field_name} must be a non-negative integer "
+                f"(booleans are not accepted)"
+            )
+    if raw["sealed_commit_seq"] < raw["snapshot_commit_seq"]:
+        raise CaptureArchiveError(
+            f"{where}: sealed_commit_seq ({raw['sealed_commit_seq']}) must be >= "
+            f"snapshot_commit_seq ({raw['snapshot_commit_seq']})"
+        )
+    if raw["schema_history"] != HISTORY_NAME:
+        raise CaptureArchiveError(
+            f"{where}: schema_history must be {HISTORY_NAME!r}, got "
+            f"{raw['schema_history']!r}"
+        )
+    history_hash = raw["history_hash"]
+    if not isinstance(history_hash, str) or len(history_hash) != 64:
+        raise CaptureArchiveError(
+            f"{where}: history_hash must be a 64-character hex SHA-256 digest"
+        )
+    try:
+        int(history_hash, 16)
+    except ValueError:
+        raise CaptureArchiveError(
+            f"{where}: history_hash must be a 64-character hex SHA-256 digest"
+        ) from None
+    streams = _parse_streams(raw["streams"], where)
+    files = _parse_files(archive, raw["files"], where,
+                         allow=(MANIFEST_NAME, HISTORY_NAME))
+    history_path = archive / HISTORY_NAME
+    if not history_path.is_file():
+        raise CaptureArchiveError(
+            f"{where}: schema history file not found: {HISTORY_NAME}"
+        )
+    if history_path.is_symlink():
+        raise CaptureArchiveError(
+            f"{where}: symlinks are not allowed: {HISTORY_NAME}"
+        )
+    from .history import load_schema_history, validate_against_target
+    from .importer import hash_bytes
+
+    history = load_schema_history(history_path)
+    actual = hash_bytes(history.canonical_bytes())
+    if actual != history_hash:
+        raise CaptureArchiveError(
+            f"{where}: history_hash does not match {HISTORY_NAME} content "
+            f"(manifest {history_hash}, file {actual}); the archive references "
+            "a different schema history than it was sealed with"
+        )
+    if history.first().effective_commit_seq > raw["snapshot_commit_seq"]:
+        raise CaptureSchemaHistoryError(
+            f"{where}: schema version {history.first().version} becomes "
+            f"effective at commit_seq {history.first().effective_commit_seq}, "
+            f"after snapshot_commit_seq {raw['snapshot_commit_seq']}; the "
+            "snapshot cannot be interpreted and version 1 must be initial"
+        )
+    for version in history.versions[1:]:
+        if version.effective_commit_seq > raw["sealed_commit_seq"]:
+            raise CaptureSchemaHistoryError(
+                f"{where}: schema version {version.version} becomes effective at "
+                f"commit_seq {version.effective_commit_seq}, beyond "
+                f"sealed_commit_seq {raw['sealed_commit_seq']}"
+            )
+    validate_against_target(history, schema, raw)
+    return Manifest(
+        version=SCHEMA_EVOLVING_FORMAT_VERSION,
+        source_id=source_id,
+        snapshot_commit_seq=raw["snapshot_commit_seq"],
+        sealed_commit_seq=raw["sealed_commit_seq"],
+        streams=streams,
+        files=files,
+        bindings=_history_bindings(history),
+        raw=raw,
+        archive_dir=str(archive),
+        history=history,
+    )
+
+
+def _history_bindings(history) -> Bindings:
+    """A compatibility ``Bindings`` view over the final history version."""
+    last = history.versions[-1]
+    tables: dict[str, TableBinding] = {}
+    for source_table, table in last.tables.items():
+        tables[source_table] = TableBinding(
+            source_table=source_table,
+            target_table=table.target_table,
+            columns={f.name: f.name for f in table.fields},
+        )
+    return Bindings(tables=tables)
 
 
 def _parse_streams(value: object, where: str) -> tuple[StreamSpec, ...]:
@@ -229,7 +372,10 @@ def _parse_streams(value: object, where: str) -> tuple[StreamSpec, ...]:
     return tuple(specs)
 
 
-def _parse_files(archive: Path, value: object, where: str) -> tuple[str, ...]:
+def _parse_files(
+    archive: Path, value: object, where: str,
+    allow: tuple[str, ...] = (MANIFEST_NAME,),
+) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise CaptureArchiveError(f"{where}: files must be a non-empty array")
     files: list[str] = []
@@ -252,7 +398,7 @@ def _parse_files(archive: Path, value: object, where: str) -> tuple[str, ...]:
     for root, dirnames, filenames in os.walk(archive):
         for fname in filenames:
             candidate = Path(root) / fname
-            if candidate == archive / MANIFEST_NAME:
+            if candidate in {archive / name for name in allow}:
                 continue
             if candidate not in declared:
                 rel = candidate.relative_to(archive).as_posix()
